@@ -41,11 +41,11 @@ training:
   batch_size: 256
   learning_rate: 1e-4
   discriminator_lr: 1e-4
-  n_critic: 1  # Number of discriminator updates per generator update (1:1 for speed)
+  n_critic: 2  # Number of discriminator updates per generator update (1:1 for speed)
 
   # Optimizer settings
   optimizer:
-    betas: [0.5, 0.999]
+    betas: [0.0, 0.9]
     weight_decay: 0.0
 
   # Learning rate scheduler (optional)
@@ -61,13 +61,13 @@ training:
 # 3. 16 → 12: kernel=5, stride=1, RF=5×5 (26.36M params)
 # 4. 16 → 8:  kernel=3, stride=2, RF=3×3 (9.50M params)
 compression:
-  input_grid_size: 24   # Input token grid size: 16 or 24
+  input_grid_size: 16   # Input token grid size: 16 or 24
   output_grid_size: 8   # Output token grid size: 8 or 12
 
 # Data settings
 data:
   imagenet_root: "/home/elicer/ImageNet"  # UPDATE THIS PATH
-  num_workers: 4
+  num_workers: 8
   pin_memory: true
   use_subset: false  # Set to true for quick testing
   subset_size: 1000
@@ -93,5 +93,5 @@ validation:
 
 # Logging settings
 logging:
-  log_frequency: 50  # Log to wandb every N steps
+  log_frequency: 1  # Log to wandb every N steps
   print_frequency: 10  # Print to console every N steps
