@@ -141,10 +141,16 @@ class RFTokenCompressionTrainer:
         # Accumulators
         metrics = {
             'disc_loss': 0.0,
-            'disc_real': 0.0,
-            'disc_fake': 0.0,
-            'grad_penalty': 0.0,
             'wasserstein_dist': 0.0,
+            'grad_penalty': 0.0,
+            'real_score_mean': 0.0,
+            'fake_score_mean': 0.0,
+            'real_score_std': 0.0,
+            'fake_score_std': 0.0,
+            'gradient_norm_mean': 0.0,
+            'gradient_norm_std': 0.0,
+            'gradient_norm_min': 0.0,
+            'gradient_norm_max': 0.0,
             'gen_loss': 0.0,
             'cosine_loss': 0.0,
             'total_gen_loss': 0.0,
@@ -221,10 +227,16 @@ class RFTokenCompressionTrainer:
             # Update metrics
             # ============================================
             metrics['disc_loss'] += disc_info['disc_loss']
-            metrics['disc_real'] += disc_info.get('disc_real_mean', 0.0)
-            metrics['disc_fake'] += disc_info.get('disc_fake_mean', 0.0)
-            metrics['grad_penalty'] += disc_info['gradient_penalty']
             metrics['wasserstein_dist'] += disc_info['wasserstein_distance']
+            metrics['grad_penalty'] += disc_info['gradient_penalty']
+            metrics['real_score_mean'] += disc_info['real_score_mean']
+            metrics['fake_score_mean'] += disc_info['fake_score_mean']
+            metrics['real_score_std'] += disc_info['real_score_std']
+            metrics['fake_score_std'] += disc_info['fake_score_std']
+            metrics['gradient_norm_mean'] += disc_info['gradient_norm_mean']
+            metrics['gradient_norm_std'] += disc_info['gradient_norm_std']
+            metrics['gradient_norm_min'] += disc_info['gradient_norm_min']
+            metrics['gradient_norm_max'] += disc_info['gradient_norm_max']
             metrics['gen_loss'] += gen_info['gen_loss']
             metrics['cosine_loss'] += cosine_info['cosine_sim_loss']
             metrics['total_gen_loss'] += total_loss.item()
@@ -237,20 +249,39 @@ class RFTokenCompressionTrainer:
             # ============================================
             if self.use_wandb and should_log:
                 wandb.log({
+                    # Discriminator losses
                     'train/disc_loss': disc_info['disc_loss'],
-                    'train/disc_real': disc_info.get('disc_real_mean', 0.0),
-                    'train/disc_fake': disc_info.get('disc_fake_mean', 0.0),
-                    'train/grad_penalty': disc_info['gradient_penalty'],
                     'train/wasserstein_dist': disc_info['wasserstein_distance'],
+                    'train/grad_penalty': disc_info['gradient_penalty'],
+
+                    # Discriminator scores (real vs fake)
+                    'train/real_score_mean': disc_info['real_score_mean'],
+                    'train/fake_score_mean': disc_info['fake_score_mean'],
+                    'train/real_score_std': disc_info['real_score_std'],
+                    'train/fake_score_std': disc_info['fake_score_std'],
+
+                    # Gradient norm statistics
+                    'train/gradient_norm_mean': disc_info['gradient_norm_mean'],
+                    'train/gradient_norm_std': disc_info['gradient_norm_std'],
+                    'train/gradient_norm_min': disc_info['gradient_norm_min'],
+                    'train/gradient_norm_max': disc_info['gradient_norm_max'],
+
+                    # Generator losses
                     'train/gen_loss': gen_info['gen_loss'],
                     'train/cosine_loss': cosine_info['cosine_sim_loss'],
                     'train/total_gen_loss': total_loss.item(),
+
+                    # Cosine similarity statistics
                     'train/mean_similarity': cosine_info['mean_similarity'],
                     'train/min_similarity': cosine_info['min_similarity'],
                     'train/max_similarity': cosine_info['max_similarity'],
                     'train/std_similarity': cosine_info['std_similarity'],
+
+                    # Learning rates
                     'train/lr_G': self.optimizer_G.param_groups[0]['lr'],
                     'train/lr_D': self.optimizer_D.param_groups[0]['lr'],
+
+                    # Training progress
                     'global_step': self.global_step,
                     'epoch': epoch
                 }, step=self.global_step)

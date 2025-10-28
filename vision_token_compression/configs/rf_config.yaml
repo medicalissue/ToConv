@@ -25,7 +25,7 @@ model:
 # Loss settings
 loss:
   rf_wgan:
-    lambda_gp: 10.0  # Gradient penalty weight
+    lambda_gp: 1.0  # Gradient penalty weight
 
   rf_cosine_similarity:
     # Loss = 1 - mean_similarity (range: 0 to 2)

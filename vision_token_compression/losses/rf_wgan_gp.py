@@ -82,7 +82,7 @@ class RFWGANGPLoss(nn.Module):
         critic_loss = -wasserstein_distance
 
         # Gradient penalty
-        gp = compute_rf_gradient_penalty(
+        gp, gp_info = compute_rf_gradient_penalty(
             discriminator,
             real_flat,
             fake_flat,
@@ -103,7 +103,12 @@ class RFWGANGPLoss(nn.Module):
             'real_score_mean': real_scores.mean().item(),
             'fake_score_mean': fake_scores.mean().item(),
             'real_score_std': real_scores_2d.std().item(),
-            'fake_score_std': fake_scores_2d.std().item()
+            'fake_score_std': fake_scores_2d.std().item(),
+            # Gradient norm statistics
+            'gradient_norm_mean': gp_info['gradient_norm_mean'],
+            'gradient_norm_std': gp_info['gradient_norm_std'],
+            'gradient_norm_min': gp_info['gradient_norm_min'],
+            'gradient_norm_max': gp_info['gradient_norm_max']
         }
 
         return loss, info
@@ -237,7 +242,7 @@ def compute_rf_gradient_penalty(
     real_tokens: torch.Tensor,  # (B*k², hidden_dim)
     fake_tokens: torch.Tensor,  # (B*k², hidden_dim)
     device: torch.device
-) -> torch.Tensor:
+) -> tuple[torch.Tensor, dict]:
     """
     Gradient penalty for single token discrimination.
 
@@ -248,7 +253,7 @@ def compute_rf_gradient_penalty(
         device: Device to run on
 
     Returns:
-        Gradient penalty value
+        Gradient penalty value and dictionary with gradient norm statistics
     """
     num_samples = real_tokens.size(0)
 
@@ -278,7 +283,15 @@ def compute_rf_gradient_penalty(
     # Gradient penalty: (||grad|| - 1)^2
     gradient_penalty = ((gradient_norm - 1) ** 2).mean()
 
-    return gradient_penalty
+    # Gradient norm statistics
+    gp_info = {
+        'gradient_norm_mean': gradient_norm.mean().item(),
+        'gradient_norm_std': gradient_norm.std().item(),
+        'gradient_norm_min': gradient_norm.min().item(),
+        'gradient_norm_max': gradient_norm.max().item()
+    }
+
+    return gradient_penalty, gp_info
 
 
 if __name__ == "__main__":
