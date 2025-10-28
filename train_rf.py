@@ -384,6 +384,9 @@ def main(cfg: DictConfig):
     # Setup device
     if torch.cuda.is_available():
         device = torch.device(f'cuda:{cfg.hardware.cuda_device}')
+        # Initialize CUDA context early to avoid warnings
+        torch.cuda.set_device(device)
+        torch.cuda.init()  # Explicitly initialize CUDA
         print(f"\n✓ Using GPU: {torch.cuda.get_device_name(device)}")
         print(f"  Memory: {torch.cuda.get_device_properties(device).total_memory / 1e9:.1f} GB")
     else:
