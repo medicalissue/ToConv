@@ -15,13 +15,11 @@ model:
     image_size: 224 #336
 
   compressor:
-    output_grid_size: 8  # Compress to 6x6 grid (36 tokens)
-    bottleneck_dim: 256  # Hidden dimension for compression (256/512/1024)
+    hidden_dim: 1024  # CLIP ViT-L token dimension
 
   rf_discriminator:
-    # Processes single tokens (B*36, 1024)
-    num_layers: 3
-    mlp_ratio: 4
+    # Fixed architecture: 1024 -> 512 -> 256 -> 1
+    # Processes single tokens (B*N, 1024) where N = output_grid_size^2
     dropout: 0.1
 
 # Loss settings
@@ -56,10 +54,14 @@ training:
     warmup_epochs: 3
     min_lr: 1e-6
 
-# Grid settings
-grid:
-  original_grid_size: 24  # 24×24 = 576 tokens from CLIP
-  compressed_grid_size: 8  # 6×6 = 36 compressed tokens
+# Compression settings - Choose one of 4 supported configurations:
+# 1. 24 → 12: kernel=3, stride=2, RF=3×3 (9.59M params)
+# 2. 24 → 8:  kernel=5, stride=3, RF=5×5 (26.28M params)
+# 3. 16 → 12: kernel=5, stride=1, RF=5×5 (26.36M params)
+# 4. 16 → 8:  kernel=3, stride=2, RF=3×3 (9.50M params)
+compression:
+  input_grid_size: 24   # Input token grid size: 16 or 24
+  output_grid_size: 8   # Output token grid size: 8 or 12
 
 # Data settings
 data:
@@ -77,7 +79,7 @@ hardware:
 
 # Checkpoint settings
 checkpoint:
-  save_dir: "./checkpoints_rf"
+  save_dir: "./checkpoints_rf"  # Will be auto-suffixed with config (e.g., checkpoints_rf/24to8)
   save_frequency: 5  # Save every N epochs
   keep_last_n: 3  # Keep only last N checkpoints
 
@@ -85,7 +87,7 @@ checkpoint:
 validation:
   frequency: 1  # Validate every N epochs
   save_rf_visualizations: true  # Save RF reconstruction visualizations
-  visualize_rf_indices: [0, 17, 35]  # Which RFs to visualize
+  visualize_rf_indices: [0, 17, 35]  # Which RFs to visualize (adjust based on output_grid_size^2)
   compute_detailed_stats: true  # Compute per-RF statistics
 
 # Logging settings
