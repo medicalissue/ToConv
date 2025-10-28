@@ -58,34 +58,33 @@ class RFTokenCompressionTrainer:
         ).to(device)
         self.clip_encoder.eval()
 
-        grid_size = self.clip_encoder.get_grid_size()
         hidden_dim = self.clip_encoder.get_hidden_size()
 
         # Token compressor
         self.compressor = TokenCompressor(
-            input_grid_size=grid_size,
-            output_grid_size=cfg.model.compressor.output_grid_size,
-            hidden_dim=hidden_dim,
-            bottleneck_dim=cfg.model.compressor.bottleneck_dim
+            input_grid_size=cfg.compression.input_grid_size,
+            output_grid_size=cfg.compression.output_grid_size,
+            hidden_dim=hidden_dim
         ).to(device)
 
-        # RF Discriminator
+        # RF Discriminator (Fixed 1024->512->256->1)
         self.discriminator = RFDiscriminator(
             hidden_dim=hidden_dim,
-            num_layers=cfg.model.rf_discriminator.num_layers,
-            mlp_ratio=cfg.model.rf_discriminator.mlp_ratio,
             dropout=cfg.model.rf_discriminator.dropout
         ).to(device)
 
         # Print model info
         rf_size = self.compressor.get_receptive_field_size()
+        input_size = cfg.compression.input_grid_size
+        output_size = cfg.compression.output_grid_size
+
         print(f"\n✓ CLIP Encoder: {cfg.model.clip.model_name}")
-        print(f"  - Grid: {grid_size}×{grid_size} → {cfg.model.compressor.output_grid_size}×{cfg.model.compressor.output_grid_size}")
-        print(f"  - Compression: {(grid_size**2) / (cfg.model.compressor.output_grid_size**2):.1f}x")
+        print(f"  - Grid: {input_size}×{input_size} → {output_size}×{output_size}")
+        print(f"  - Compression: {(input_size**2) / (output_size**2):.1f}x")
         print(f"  - Hidden dim: {hidden_dim}")
 
-        print(f"\n✓ Token Compressor")
-        print(f"  - Bottleneck: {cfg.model.compressor.bottleneck_dim}")
+        print(f"\n✓ Token Compressor [{self.compressor.config_name}]")
+        print(f"  - Architecture: Single Conv (no bottleneck)")
         print(f"  - Theoretical RF: {rf_size}×{rf_size}")
         print(f"  - Params: {sum(p.numel() for p in self.compressor.parameters())/1e6:.2f}M")
 
@@ -129,8 +128,8 @@ class RFTokenCompressionTrainer:
         self.best_val_loss = float('inf')
 
         # Grid sizes for loss computation
-        self.compressed_grid_size = cfg.model.compressor.output_grid_size
-        self.original_grid_size = grid_size
+        self.compressed_grid_size = cfg.compression.output_grid_size
+        self.original_grid_size = cfg.compression.input_grid_size
         self.n_critic = cfg.training.n_critic
 
     def train_epoch(self, train_loader, epoch: int) -> Dict[str, float]:
