@@ -1,0 +1,109 @@
+# RF-based Token Compression Configuration
+
+experiment:
+  name: "rf_vision_token_compression"
+  seed: 42
+  use_wandb: true
+  wandb_project: "rf-vision-token-compression"
+  wandb_entity: null  # Set your wandb entity here
+
+# Model settings
+model:
+  clip:
+    model_name: "openai/clip-vit-large-patch14-336"
+    freeze: true
+    image_size: 336
+
+  compressor:
+    output_grid_size: 6  # Compress to 6x6 grid (36 tokens)
+    num_layers: 3
+    use_residual: true
+    use_layer_norm: true
+
+  rf_discriminator:
+    # Processes single tokens (B*36, 1024)
+    num_layers: 3
+    mlp_ratio: 4
+    dropout: 0.1
+
+  rf_autoencoder:
+    # Each compressed token reconstructs its 4x4 RF
+    rf_size: 4
+    num_layers: 3
+    use_conv: true  # Use 2D conv upsampling (vs MLP)
+    dropout: 0.1
+    use_attention: false  # Alternative: use attention-based decoder
+
+# Loss settings
+loss:
+  rf_wgan:
+    lambda_gp: 10.0  # Gradient penalty weight
+
+  rf_autoencoder:
+    loss_type: "hybrid"  # Options: mse, cosine, hybrid
+    normalize: true  # Normalize tokens before loss
+    per_rf_weight: true  # Weight each RF equally
+
+  weights:
+    wgan: 1.0  # Weight for WGAN-GP loss
+    ae: 1.0    # Weight for AutoEncoder loss
+
+# Training settings
+training:
+  epochs: 100
+  batch_size: 32
+  learning_rate: 1e-4
+  discriminator_lr: 1e-4
+  n_critic: 5  # Number of discriminator updates per generator update
+
+  # Optimizer settings
+  optimizer:
+    betas: [0.5, 0.999]
+    weight_decay: 0.0
+
+  # Learning rate scheduler (optional)
+  scheduler:
+    use: false
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr: 1e-6
+
+# Grid settings
+grid:
+  original_grid_size: 24  # 24×24 = 576 tokens from CLIP
+  compressed_grid_size: 6  # 6×6 = 36 compressed tokens
+  rf_size: 4  # 4×4 = 16 tokens per receptive field
+
+# Data settings
+data:
+  imagenet_root: "/path/to/imagenet"  # UPDATE THIS PATH
+  num_workers: 4
+  pin_memory: true
+  use_subset: false  # Set to true for quick testing
+  subset_size: 1000
+
+# Hardware settings
+hardware:
+  cuda_device: 0  # CUDA device number
+  mixed_precision: false  # Use automatic mixed precision (experimental)
+  compile: false  # Use torch.compile (requires PyTorch 2.0+)
+
+# Checkpoint settings
+checkpoint:
+  save_dir: "./checkpoints_rf"
+  save_frequency: 5  # Save every N epochs
+  keep_last_n: 3  # Keep only last N checkpoints
+
+# Validation settings
+validation:
+  frequency: 1  # Validate every N epochs
+  save_rf_visualizations: true  # Save RF reconstruction visualizations
+  visualize_rf_indices: [0, 17, 35]  # Which RFs to visualize
+  compute_detailed_stats: true  # Compute per-RF statistics
+
+# Logging settings
+logging:
+  log_frequency: 100  # Log every N steps
+  print_frequency: 10  # Print to console every N steps
+  log_rf_heatmap: true  # Log RF similarity heatmap
+  log_rf_distribution: true  # Log distribution of RF qualities
