@@ -145,7 +145,7 @@ if __name__ == "__main__":
     assert scores_flat.shape == (batch_size * num_tokens, 1)
 
     # Reshape to (B, 36, 1)
-    scores_reshaped = scores_flat.view(batch_size, num_tokens, 1)
+    scores_reshaped = scores_flat.reshape(batch_size, num_tokens, 1)
     print(f"Reshaped scores: {scores_reshaped.shape}")
     print("✓ Flattened batch test passed!")
 

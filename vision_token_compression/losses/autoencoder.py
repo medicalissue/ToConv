@@ -203,11 +203,11 @@ class PerceptualReconstructionLoss(nn.Module):
 
         # Reshape to 2D grid
         # (B, N, C) -> (B, H, W, C) -> (B, C, H, W)
-        recon_2d = reconstructed.view(
+        recon_2d = reconstructed.reshape(
             batch_size, self.grid_size, self.grid_size, hidden_dim
         ).permute(0, 3, 1, 2)
 
-        target_2d = target.view(
+        target_2d = target.reshape(
             batch_size, self.grid_size, self.grid_size, hidden_dim
         ).permute(0, 3, 1, 2)
 

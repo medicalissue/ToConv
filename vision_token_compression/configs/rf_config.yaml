@@ -26,27 +26,17 @@ model:
     mlp_ratio: 4
     dropout: 0.1
 
-  rf_autoencoder:
-    # Each compressed token reconstructs its 4x4 RF
-    rf_size: 4
-    num_layers: 3
-    use_conv: true  # Use 2D conv upsampling (vs MLP)
-    dropout: 0.1
-    use_attention: false  # Alternative: use attention-based decoder
-
 # Loss settings
 loss:
   rf_wgan:
     lambda_gp: 10.0  # Gradient penalty weight
 
-  rf_autoencoder:
-    loss_type: "hybrid"  # Options: mse, cosine, hybrid
-    normalize: true  # Normalize tokens before loss
-    per_rf_weight: true  # Weight each RF equally
+  rf_cosine_similarity:
+    temperature: 0.07  # Temperature for similarity scaling
 
   weights:
-    wgan: 1.0  # Weight for WGAN-GP loss
-    ae: 1.0    # Weight for AutoEncoder loss
+    wgan: 1.0      # Weight for WGAN-GP loss
+    cosine: 1.0    # Weight for Cosine Similarity loss
 
 # Training settings
 training:

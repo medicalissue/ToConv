@@ -9,7 +9,7 @@ class RFWGANGPLoss(nn.Module):
     RF-based WGAN-GP Loss.
 
     Compares:
-    - 36 compressed tokens vs 36 sampled original tokens
+    - k² compressed tokens vs k² sampled original tokens
     - Each comparison is RF-aware (sampled from corresponding RF)
     """
 
@@ -23,8 +23,8 @@ class RFWGANGPLoss(nn.Module):
 
     def discriminator_loss(
         self,
-        compressed_tokens: torch.Tensor,  # (B, 36, 1024)
-        original_tokens: torch.Tensor,    # (B, 576, 1024)
+        compressed_tokens: torch.Tensor,  # (B, k², hidden_dim)
+        original_tokens: torch.Tensor,    # (B, original_grid_size², hidden_dim)
         discriminator: nn.Module,
         compressed_grid_size: int,
         original_grid_size: int,
@@ -34,11 +34,11 @@ class RFWGANGPLoss(nn.Module):
         Compute RF-aware discriminator loss.
 
         Args:
-            compressed_tokens: (B, 36, 1024) - compressed tokens
-            original_tokens: (B, 576, 1024) - original tokens
+            compressed_tokens: (B, k², hidden_dim) - compressed tokens
+            original_tokens: (B, original_grid_size², hidden_dim) - original tokens
             discriminator: RFDiscriminator model
-            compressed_grid_size: 6
-            original_grid_size: 24
+            compressed_grid_size: Size k of compressed grid
+            original_grid_size: Size of original token grid
             device: Device to run on
 
         Returns:
@@ -46,6 +46,19 @@ class RFWGANGPLoss(nn.Module):
             info: Dictionary with loss components
         """
         batch_size = original_tokens.shape[0]
+        expected_real_tokens = original_grid_size ** 2
+        if original_tokens.shape[1] != expected_real_tokens:
+            raise ValueError(
+                "Mismatch between original_grid_size and number of original tokens: "
+                f"expected {expected_real_tokens}, got {original_tokens.shape[1]}"
+            )
+
+        expected_compressed_tokens = compressed_grid_size ** 2
+        if compressed_tokens.shape[1] != expected_compressed_tokens:
+            raise ValueError(
+                "Mismatch between compressed_grid_size and number of compressed tokens: "
+                f"expected {expected_compressed_tokens}, got {compressed_tokens.shape[1]}"
+            )
 
         # Sample 1 token from each RF
         sampled_real = sample_rf_tokens(
@@ -53,16 +66,16 @@ class RFWGANGPLoss(nn.Module):
             compressed_grid_size,
             original_grid_size,
             device
-        )  # (B, 36, 1024)
+        )  # (B, k², hidden_dim)
 
         # Flatten for batch discrimination
-        # (B, 36, 1024) → (B*36, 1024)
-        real_flat = sampled_real.view(-1, sampled_real.shape[-1])
-        fake_flat = compressed_tokens.view(-1, compressed_tokens.shape[-1])
+        # (B, k², hidden_dim) → (B*k², hidden_dim)
+        real_flat = sampled_real.reshape(-1, sampled_real.shape[-1])
+        fake_flat = compressed_tokens.reshape(-1, compressed_tokens.shape[-1])
 
         # Get discrimination scores
-        real_scores = discriminator(real_flat)  # (B*36, 1)
-        fake_scores = discriminator(fake_flat)  # (B*36, 1)
+        real_scores = discriminator(real_flat)  # (B*k², 1)
+        fake_scores = discriminator(fake_flat)  # (B*k², 1)
 
         # Compute WGAN loss
         wasserstein_distance = real_scores.mean() - fake_scores.mean()
@@ -80,8 +93,8 @@ class RFWGANGPLoss(nn.Module):
         loss = critic_loss + self.lambda_gp * gp
 
         # Reshape scores for statistics
-        real_scores_2d = real_scores.view(batch_size, -1)  # (B, 36)
-        fake_scores_2d = fake_scores.view(batch_size, -1)  # (B, 36)
+        real_scores_2d = real_scores.reshape(batch_size, -1)  # (B, k²)
+        fake_scores_2d = fake_scores.reshape(batch_size, -1)  # (B, k²)
 
         info = {
             'disc_loss': loss.item(),
@@ -97,25 +110,25 @@ class RFWGANGPLoss(nn.Module):
 
     def generator_loss(
         self,
-        compressed_tokens: torch.Tensor,  # (B, 36, 1024)
+        compressed_tokens: torch.Tensor,  # (B, k², hidden_dim)
         discriminator: nn.Module,
     ) -> tuple[torch.Tensor, dict]:
         """
         Compute generator (compressor) loss.
 
         Args:
-            compressed_tokens: (B, 36, 1024) - compressed tokens
+            compressed_tokens: (B, k², hidden_dim) - compressed tokens
             discriminator: RFDiscriminator model
 
         Returns:
             loss: Generator loss
             info: Dictionary with loss components
         """
-        # Flatten: (B, 36, 1024) → (B*36, 1024)
-        fake_flat = compressed_tokens.view(-1, compressed_tokens.shape[-1])
+        # Flatten: (B, k², hidden_dim) → (B*k², hidden_dim)
+        fake_flat = compressed_tokens.reshape(-1, compressed_tokens.shape[-1])
 
         # Get scores
-        fake_scores = discriminator(fake_flat)  # (B*36, 1)
+        fake_scores = discriminator(fake_flat)  # (B*k², 1)
 
         # Generator wants to maximize D(fake)
         # For minimization: minimize -D(fake)
@@ -140,16 +153,16 @@ def sample_rf_tokens(
     For each compressed token position, randomly sample 1 token from its RF.
 
     Args:
-        original_tokens: (B, 576, 1024) - 24×24 grid
-        compressed_grid_size: 6
-        original_grid_size: 24
+        original_tokens: (B, original_grid_size², hidden_dim) - full-resolution grid
+        compressed_grid_size: Size k of compressed k×k grid
+        original_grid_size: Size of original grid
 
     Returns:
-        sampled_tokens: (B, 36, 1024) - one sampled token per compressed position
+        sampled_tokens: (B, k², hidden_dim) - one sampled token per compressed position
     """
     batch_size = original_tokens.shape[0]
     hidden_dim = original_tokens.shape[2]
-    rf_size = original_grid_size // compressed_grid_size  # 4
+    rf_size = original_grid_size // compressed_grid_size
 
     sampled_tokens = []
 
@@ -159,23 +172,23 @@ def sample_rf_tokens(
             start_i = i * rf_size
             start_j = j * rf_size
 
-            # Collect RF token indices
+            # Collect RF token indices for this RF
             rf_indices = []
             for di in range(rf_size):
                 for dj in range(rf_size):
                     idx = (start_i + di) * original_grid_size + (start_j + dj)
                     rf_indices.append(idx)
 
-            # Extract RF tokens: (B, 16, 1024)
+            # Extract RF tokens: (B, rf_size², hidden_dim)
             rf_tokens = original_tokens[:, rf_indices, :]
 
-            # Randomly sample 1 token from the 16 RF tokens for each batch item
+            # Randomly sample 1 token from the RF tokens for each batch item
             rand_idx = torch.randint(0, rf_size * rf_size, (batch_size,), device=device)
             sampled = rf_tokens[torch.arange(batch_size, device=device), rand_idx, :]  # (B, 1024)
 
             sampled_tokens.append(sampled)
 
-    # Stack: List of 36 × (B, 1024) → (B, 36, 1024)
+    # Stack: List of k² × (B, hidden_dim) → (B, k², hidden_dim)
     sampled_tokens = torch.stack(sampled_tokens, dim=1)
 
     return sampled_tokens
@@ -183,8 +196,8 @@ def sample_rf_tokens(
 
 def compute_rf_gradient_penalty(
     discriminator: nn.Module,
-    real_tokens: torch.Tensor,  # (B*36, 1024)
-    fake_tokens: torch.Tensor,  # (B*36, 1024)
+    real_tokens: torch.Tensor,  # (B*k², hidden_dim)
+    fake_tokens: torch.Tensor,  # (B*k², hidden_dim)
     device: torch.device
 ) -> torch.Tensor:
     """
@@ -192,8 +205,8 @@ def compute_rf_gradient_penalty(
 
     Args:
         discriminator: The discriminator network
-        real_tokens: (B*36, 1024) - flattened real tokens
-        fake_tokens: (B*36, 1024) - flattened fake tokens
+        real_tokens: (B*k², hidden_dim) - flattened real tokens
+        fake_tokens: (B*k², hidden_dim) - flattened fake tokens
         device: Device to run on
 
     Returns:

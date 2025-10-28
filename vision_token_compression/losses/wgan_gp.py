@@ -128,7 +128,7 @@ def compute_gradient_penalty(
     )[0]
 
     # Flatten gradients: (batch_size, num_tokens, hidden_dim) -> (batch_size, -1)
-    gradients = gradients.view(batch_size, -1)
+    gradients = gradients.reshape(batch_size, -1)
 
     # Compute gradient norm for each sample
     gradient_norm = gradients.norm(2, dim=1)

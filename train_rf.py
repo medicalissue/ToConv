@@ -11,10 +11,9 @@ import numpy as np
 from vision_token_compression.models import (
     CLIPVisionEncoder,
     TokenCompressor,
-    RFDiscriminator,
-    RFAutoEncoderDecoder
+    RFDiscriminator
 )
-from vision_token_compression.losses import RFWGANGPLoss, RFAutoEncoderLoss
+from vision_token_compression.losses import RFWGANGPLoss, RFCosineSimilarityLoss
 from vision_token_compression.data import create_imagenet_dataloaders
 from vision_token_compression.rf_trainer import RFTokenCompressionTrainer
 
@@ -92,35 +91,18 @@ def create_models(cfg: DictConfig, device: torch.device):
     print(f"   - Applied to: {output_grid_size**2} token pairs per batch")
     print(f"   - Parameters: {sum(p.numel() for p in rf_discriminator.parameters()) / 1e6:.2f}M")
 
-    # RF AutoEncoder decoder
-    print(f"\n4. RF AutoEncoder Decoder")
-    rf_ae_decoder = RFAutoEncoderDecoder(
-        hidden_dim=hidden_dim,
-        rf_size=rf_size,
-        num_layers=cfg.model.rf_autoencoder.num_layers,
-        use_conv=cfg.model.rf_autoencoder.use_conv,
-        dropout=cfg.model.rf_autoencoder.dropout
-    )
-    decoder_type = "2D Convolutional" if cfg.model.rf_autoencoder.use_conv else "MLP"
-    print(f"   - Decoder type: {decoder_type}")
-    print(f"   - Each token reconstructs: {rf_size}×{rf_size} = {rf_size**2} RF tokens")
-    print(f"   - Parameters: {sum(p.numel() for p in rf_ae_decoder.parameters()) / 1e6:.2f}M")
-
     # Move to device
     clip_encoder = clip_encoder.to(device)
     compressor = compressor.to(device)
     rf_discriminator = rf_discriminator.to(device)
-    rf_ae_decoder = rf_ae_decoder.to(device)
 
     total_params = (
         sum(p.numel() for p in compressor.parameters()) +
-        sum(p.numel() for p in rf_discriminator.parameters()) +
-        sum(p.numel() for p in rf_ae_decoder.parameters())
+        sum(p.numel() for p in rf_discriminator.parameters())
     )
     print(f"\nTotal trainable parameters: {total_params / 1e6:.2f}M")
-    print(f"(vs original global discriminator: saved ~{0.5:.2f}M parameters)")
 
-    return clip_encoder, compressor, rf_discriminator, rf_ae_decoder
+    return clip_encoder, compressor, rf_discriminator
 
 
 @hydra.main(version_base=None, config_path="vision_token_compression/configs", config_name="rf_config")
@@ -153,7 +135,7 @@ def main(cfg: DictConfig):
         print(f"\nWandB initialized: {cfg.experiment.wandb_project}/{cfg.experiment.name}")
 
     # Create models
-    clip_encoder, compressor, rf_discriminator, rf_ae_decoder = create_models(cfg, device)
+    clip_encoder, compressor, rf_discriminator = create_models(cfg, device)
 
     # Create losses
     print("\n" + "=" * 80)
@@ -161,10 +143,8 @@ def main(cfg: DictConfig):
     print("=" * 80)
 
     rf_wgan_loss = RFWGANGPLoss(lambda_gp=cfg.loss.rf_wgan.lambda_gp)
-    rf_ae_loss = RFAutoEncoderLoss(
-        loss_type=cfg.loss.rf_autoencoder.loss_type,
-        normalize=cfg.loss.rf_autoencoder.normalize,
-        per_rf_weight=cfg.loss.rf_autoencoder.per_rf_weight
+    rf_cosine_loss = RFCosineSimilarityLoss(
+        temperature=cfg.loss.rf_cosine_similarity.temperature
     )
 
     print(f"\n1. RF WGAN-GP Loss")
@@ -172,12 +152,11 @@ def main(cfg: DictConfig):
     print(f"   - Loss weight: {cfg.loss.weights.wgan}")
     print(f"   - Comparison: 36 compressed vs 36 sampled RF tokens (1:1)")
 
-    print(f"\n2. RF AutoEncoder Loss")
-    print(f"   - Loss type: {cfg.loss.rf_autoencoder.loss_type}")
-    print(f"   - Normalize: {cfg.loss.rf_autoencoder.normalize}")
-    print(f"   - Per-RF weighting: {cfg.loss.rf_autoencoder.per_rf_weight}")
-    print(f"   - Loss weight: {cfg.loss.weights.ae}")
-    print(f"   - Reconstruction: Each token → its {cfg.grid.rf_size}×{cfg.grid.rf_size} RF")
+    print(f"\n2. RF Cosine Similarity Loss")
+    print(f"   - Temperature: {cfg.loss.rf_cosine_similarity.temperature}")
+    print(f"   - Loss weight: {cfg.loss.weights.cosine}")
+    print(f"   - Goal: Maximize similarity between compressed tokens and their RF")
+    print(f"   - Comparison: Each compressed token vs all {cfg.grid.rf_size}×{cfg.grid.rf_size} tokens in its RF")
 
     # Create data loaders
     print("\n" + "=" * 80)
@@ -208,15 +187,14 @@ def main(cfg: DictConfig):
         clip_encoder=clip_encoder,
         compressor=compressor,
         rf_discriminator=rf_discriminator,
-        rf_ae_decoder=rf_ae_decoder,
         rf_wgan_loss=rf_wgan_loss,
-        rf_ae_loss=rf_ae_loss,
+        rf_cosine_loss=rf_cosine_loss,
         device=device,
         compressed_grid_size=cfg.grid.compressed_grid_size,
         original_grid_size=cfg.grid.original_grid_size,
         learning_rate=cfg.training.learning_rate,
         discriminator_lr=cfg.training.discriminator_lr,
-        ae_weight=cfg.loss.weights.ae,
+        cosine_weight=cfg.loss.weights.cosine,
         wgan_weight=cfg.loss.weights.wgan,
         n_critic=cfg.training.n_critic,
         use_wandb=cfg.experiment.use_wandb
@@ -258,22 +236,9 @@ def main(cfg: DictConfig):
             for key, value in val_metrics.items():
                 print(f"  {key}: {value:.4f}")
 
-            # Quality summary
-            total_rfs = 36
-            excellent = val_metrics['val_excellent_rfs']
-            good = val_metrics['val_good_rfs']
-            fair = val_metrics['val_fair_rfs']
-            poor = val_metrics['val_poor_rfs']
-
-            print(f"\nRF Quality Distribution:")
-            print(f"  Excellent (>0.9): {excellent:.1f}/{total_rfs}")
-            print(f"  Good (0.8-0.9):  {good:.1f}/{total_rfs}")
-            print(f"  Fair (0.6-0.8):  {fair:.1f}/{total_rfs}")
-            print(f"  Poor (<0.6):     {poor:.1f}/{total_rfs}")
-
-            # Save best model
-            if val_metrics['val_ae_loss'] < best_val_loss:
-                best_val_loss = val_metrics['val_ae_loss']
+            # Save best model (use cosine loss - minimize it, which maximizes similarity)
+            if val_metrics['val_cosine_loss'] < best_val_loss:
+                best_val_loss = val_metrics['val_cosine_loss']
                 trainer.save_checkpoint(
                     save_dir=cfg.checkpoint.save_dir,
                     epoch=epoch,

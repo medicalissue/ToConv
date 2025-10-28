@@ -153,7 +153,7 @@ class ConvDecoder(nn.Module):
         batch_size = compressed_tokens.shape[0]
 
         # Reshape to 2D: (B, N, C) -> (B, C, H, W)
-        x = compressed_tokens.view(
+        x = compressed_tokens.reshape(
             batch_size,
             self.compressed_grid_size,
             self.compressed_grid_size,

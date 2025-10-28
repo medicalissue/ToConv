@@ -64,7 +64,6 @@ multirun/
 .hydra/
 
 # Data
-data/
 datasets/
 imagenet/
 *.tar

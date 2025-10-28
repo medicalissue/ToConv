@@ -10,16 +10,14 @@ import os
 
 from .models import CLIPVisionEncoder, TokenCompressor
 from .models.rf_discriminator import RFDiscriminator
-from .models.rf_autoencoder import RFAutoEncoderDecoder
 from .losses.rf_wgan_gp import RFWGANGPLoss
-from .losses.rf_autoencoder_loss import RFAutoEncoderLoss
-from .utils.rf_utils import compute_rf_statistics, create_rf_heatmap
+from .losses.rf_cosine_similarity_loss import RFCosineSimilarityLoss
 
 
 class RFTokenCompressionTrainer:
     """
     Trainer for RF-based vision token compression system.
-    Combines RF-aware WGAN-GP and AutoEncoder losses.
+    Combines RF-aware WGAN-GP and Cosine Similarity losses.
     """
 
     def __init__(
@@ -27,15 +25,14 @@ class RFTokenCompressionTrainer:
         clip_encoder: CLIPVisionEncoder,
         compressor: TokenCompressor,
         rf_discriminator: RFDiscriminator,
-        rf_ae_decoder: RFAutoEncoderDecoder,
         rf_wgan_loss: RFWGANGPLoss,
-        rf_ae_loss: RFAutoEncoderLoss,
+        rf_cosine_loss: RFCosineSimilarityLoss,
         device: torch.device,
         compressed_grid_size: int = 6,
         original_grid_size: int = 24,
         learning_rate: float = 1e-4,
         discriminator_lr: float = 1e-4,
-        ae_weight: float = 1.0,
+        cosine_weight: float = 1.0,
         wgan_weight: float = 1.0,
         n_critic: int = 5,
         use_wandb: bool = True
@@ -45,15 +42,14 @@ class RFTokenCompressionTrainer:
             clip_encoder: Frozen CLIP vision encoder
             compressor: Token compressor network
             rf_discriminator: RF-aware discriminator
-            rf_ae_decoder: RF-aware AutoEncoder decoder
             rf_wgan_loss: RF WGAN-GP loss function
-            rf_ae_loss: RF AutoEncoder loss function
+            rf_cosine_loss: RF Cosine Similarity loss function
             device: Device to train on
             compressed_grid_size: 6 (6x6 grid)
             original_grid_size: 24 (24x24 grid)
-            learning_rate: Learning rate for compressor and decoder
+            learning_rate: Learning rate for compressor
             discriminator_lr: Learning rate for discriminator
-            ae_weight: Weight for autoencoder loss
+            cosine_weight: Weight for cosine similarity loss
             wgan_weight: Weight for WGAN-GP loss
             n_critic: Number of discriminator updates per generator update
             use_wandb: Whether to log to Weights & Biases
@@ -61,22 +57,43 @@ class RFTokenCompressionTrainer:
         self.clip_encoder = clip_encoder.to(device)
         self.compressor = compressor.to(device)
         self.rf_discriminator = rf_discriminator.to(device)
-        self.rf_ae_decoder = rf_ae_decoder.to(device)
 
         self.rf_wgan_loss = rf_wgan_loss
-        self.rf_ae_loss = rf_ae_loss
+        self.rf_cosine_loss = rf_cosine_loss
 
         self.device = device
+        inferred_compressed_grid = getattr(self.compressor, "output_grid_size", None)
+        if inferred_compressed_grid is not None and inferred_compressed_grid > 0:
+            if compressed_grid_size != inferred_compressed_grid:
+                print(
+                    "[RFTokenCompressionTrainer] Warning: "
+                    f"compressed_grid_size={compressed_grid_size} does not match "
+                    f"compressor output ({inferred_compressed_grid}). Using "
+                    f"{inferred_compressed_grid}."
+                )
+            compressed_grid_size = inferred_compressed_grid
+
+        if hasattr(self.clip_encoder, "get_grid_size"):
+            inferred_original_grid = self.clip_encoder.get_grid_size()
+            if original_grid_size != inferred_original_grid:
+                print(
+                    "[RFTokenCompressionTrainer] Warning: "
+                    f"original_grid_size={original_grid_size} does not match "
+                    f"encoder output ({inferred_original_grid}). Using "
+                    f"{inferred_original_grid}."
+                )
+            original_grid_size = inferred_original_grid
+
         self.compressed_grid_size = compressed_grid_size
         self.original_grid_size = original_grid_size
-        self.ae_weight = ae_weight
+        self.cosine_weight = cosine_weight
         self.wgan_weight = wgan_weight
         self.n_critic = n_critic
         self.use_wandb = use_wandb
 
-        # Optimizers
+        # Optimizers (only compressor for generator)
         self.optimizer_G = torch.optim.Adam(
-            list(compressor.parameters()) + list(rf_ae_decoder.parameters()),
+            compressor.parameters(),
             lr=learning_rate,
             betas=(0.5, 0.999)
         )
@@ -108,17 +125,16 @@ class RFTokenCompressionTrainer:
         """
         self.compressor.train()
         self.rf_discriminator.train()
-        self.rf_ae_decoder.train()
         self.clip_encoder.eval()  # Always keep CLIP frozen
 
         metrics = {
             'disc_loss': 0.0,
             'gen_loss': 0.0,
-            'ae_loss': 0.0,
+            'cosine_loss': 0.0,
             'total_loss': 0.0,
             'wasserstein_distance': 0.0,
             'gradient_penalty': 0.0,
-            'rf_similarity_mean': 0.0
+            'mean_similarity': 0.0
         }
 
         num_batches = len(train_loader)
@@ -152,7 +168,7 @@ class RFTokenCompressionTrainer:
                 disc_loss.backward()
                 self.optimizer_D.step()
 
-            # --- Train Generator (Compressor + RF Decoder) ---
+            # --- Train Generator (Compressor) ---
             self.optimizer_G.zero_grad()
 
             # Compress tokens
@@ -164,19 +180,18 @@ class RFTokenCompressionTrainer:
                 discriminator=self.rf_discriminator
             )
 
-            # RF-aware reconstruction loss
-            reconstructed_rfs = self.rf_ae_decoder(compressed_tokens)  # (B, 36, 16, 1024)
-            ae_loss, ae_info = self.rf_ae_loss(
-                reconstructed_rfs=reconstructed_rfs,
+            # Cosine similarity loss (maximize similarity with RF tokens)
+            cosine_loss, cosine_info = self.rf_cosine_loss(
+                compressed_tokens=compressed_tokens,
                 original_tokens=original_tokens,
-                compressed_grid_size=self.compressed_grid_size,
-                original_grid_size=self.original_grid_size
+                compressed_grid_size=(self.compressed_grid_size, self.compressed_grid_size),
+                original_grid_size=(self.original_grid_size, self.original_grid_size)
             )
 
             # Total generator loss
             total_loss = (
                 self.wgan_weight * gen_loss +
-                self.ae_weight * ae_loss
+                self.cosine_weight * cosine_loss
             )
 
             total_loss.backward()
@@ -185,24 +200,25 @@ class RFTokenCompressionTrainer:
             # Update metrics
             metrics['disc_loss'] += disc_info['disc_loss']
             metrics['gen_loss'] += gen_info['gen_loss']
-            metrics['ae_loss'] += ae_info['ae_loss']
+            metrics['cosine_loss'] += cosine_info['cosine_sim_loss']
             metrics['total_loss'] += total_loss.item()
             metrics['wasserstein_distance'] += disc_info['wasserstein_distance']
             metrics['gradient_penalty'] += disc_info['gradient_penalty']
-            metrics['rf_similarity_mean'] += ae_info.get('rf_similarity_mean', 0.0)
+            metrics['mean_similarity'] += cosine_info['mean_similarity']
 
             # Log to wandb
             if self.use_wandb:
                 wandb.log({
                     'train/disc_loss': disc_info['disc_loss'],
                     'train/gen_loss': gen_info['gen_loss'],
-                    'train/ae_loss': ae_info['ae_loss'],
+                    'train/cosine_loss': cosine_info['cosine_sim_loss'],
                     'train/total_loss': total_loss.item(),
                     'train/wasserstein_distance': disc_info['wasserstein_distance'],
                     'train/gradient_penalty': disc_info['gradient_penalty'],
-                    'train/rf_similarity_mean': ae_info.get('rf_similarity_mean', 0.0),
-                    'train/rf_similarity_min': ae_info.get('rf_similarity_min', 0.0),
-                    'train/rf_similarity_max': ae_info.get('rf_similarity_max', 0.0),
+                    'train/mean_similarity': cosine_info['mean_similarity'],
+                    'train/min_similarity': cosine_info['min_similarity'],
+                    'train/max_similarity': cosine_info['max_similarity'],
+                    'train/std_similarity': cosine_info['std_similarity'],
                     'global_step': self.global_step
                 })
 
@@ -212,8 +228,8 @@ class RFTokenCompressionTrainer:
             pbar.set_postfix({
                 'D_loss': f"{disc_info['disc_loss']:.4f}",
                 'G_loss': f"{gen_info['gen_loss']:.4f}",
-                'AE_loss': f"{ae_info['ae_loss']:.4f}",
-                'RF_sim': f"{ae_info.get('rf_similarity_mean', 0.0):.4f}"
+                'Cos_loss': f"{cosine_info['cosine_sim_loss']:.4f}",
+                'Sim': f"{cosine_info['mean_similarity']:.4f}"
             })
 
         # Average metrics
@@ -242,21 +258,16 @@ class RFTokenCompressionTrainer:
         """
         self.compressor.eval()
         self.rf_discriminator.eval()
-        self.rf_ae_decoder.eval()
 
         metrics = {
-            'val_ae_loss': 0.0,
-            'val_rf_similarity': 0.0,
-            'val_excellent_rfs': 0.0,
-            'val_good_rfs': 0.0,
-            'val_fair_rfs': 0.0,
-            'val_poor_rfs': 0.0
+            'val_cosine_loss': 0.0,
+            'val_mean_similarity': 0.0,
+            'val_min_similarity': 0.0,
+            'val_max_similarity': 0.0
         }
 
         num_batches = len(val_loader)
         pbar = tqdm(val_loader, desc=f"Validation {epoch}")
-
-        all_rf_similarities = []
 
         for batch_idx, (images, _) in enumerate(pbar):
             images = images.to(self.device)
@@ -265,114 +276,35 @@ class RFTokenCompressionTrainer:
             original_tokens = self.clip_encoder(images)
             compressed_tokens = self.compressor(original_tokens)
 
-            # Reconstruct RFs
-            reconstructed_rfs = self.rf_ae_decoder(compressed_tokens)
-
-            # Compute RF reconstruction loss
-            ae_loss, ae_info = self.rf_ae_loss(
-                reconstructed_rfs,
+            # Compute cosine similarity loss
+            cosine_loss, cosine_info = self.rf_cosine_loss(
+                compressed_tokens,
                 original_tokens,
-                self.compressed_grid_size,
-                self.original_grid_size
-            )
-
-            # Compute detailed RF statistics
-            rf_stats = compute_rf_statistics(
-                reconstructed_rfs,
-                original_tokens,
-                self.compressed_grid_size,
-                self.original_grid_size
+                (self.compressed_grid_size, self.compressed_grid_size),
+                (self.original_grid_size, self.original_grid_size)
             )
 
             # Accumulate metrics
-            metrics['val_ae_loss'] += ae_info['ae_loss']
-            metrics['val_rf_similarity'] += rf_stats['rf_similarity_mean']
-            metrics['val_excellent_rfs'] += rf_stats['excellent_rfs']
-            metrics['val_good_rfs'] += rf_stats['good_rfs']
-            metrics['val_fair_rfs'] += rf_stats['fair_rfs']
-            metrics['val_poor_rfs'] += rf_stats['poor_rfs']
-
-            all_rf_similarities.extend(rf_stats['per_rf_similarities'])
-
-            # Save visualizations for first batch
-            if save_visualizations and batch_idx == 0:
-                self._save_rf_visualizations(
-                    original_tokens,
-                    compressed_tokens,
-                    reconstructed_rfs,
-                    epoch,
-                    rf_stats
-                )
+            metrics['val_cosine_loss'] += cosine_info['cosine_sim_loss']
+            metrics['val_mean_similarity'] += cosine_info['mean_similarity']
+            metrics['val_min_similarity'] += cosine_info['min_similarity']
+            metrics['val_max_similarity'] += cosine_info['max_similarity']
 
         # Average metrics
         for key in metrics:
-            if key.startswith('val_excellent') or key.startswith('val_good') or \
-               key.startswith('val_fair') or key.startswith('val_poor'):
-                metrics[key] /= num_batches  # These are counts, average them
-            else:
-                metrics[key] /= num_batches
+            metrics[key] /= num_batches
 
         # Log to wandb
         if self.use_wandb:
             wandb.log({
-                'val/ae_loss': metrics['val_ae_loss'],
-                'val/rf_similarity': metrics['val_rf_similarity'],
-                'val/excellent_rfs': metrics['val_excellent_rfs'],
-                'val/good_rfs': metrics['val_good_rfs'],
-                'val/fair_rfs': metrics['val_fair_rfs'],
-                'val/poor_rfs': metrics['val_poor_rfs'],
+                'val/cosine_loss': metrics['val_cosine_loss'],
+                'val/mean_similarity': metrics['val_mean_similarity'],
+                'val/min_similarity': metrics['val_min_similarity'],
+                'val/max_similarity': metrics['val_max_similarity'],
                 'epoch': epoch
             })
 
         return metrics
-
-    def _save_rf_visualizations(
-        self,
-        original_tokens: torch.Tensor,
-        compressed_tokens: torch.Tensor,
-        reconstructed_rfs: torch.Tensor,
-        epoch: int,
-        rf_stats: dict
-    ):
-        """Save RF reconstruction visualizations."""
-        from .utils.rf_utils import visualize_rf_reconstruction, create_rf_heatmap
-
-        vis_dir = Path("./visualizations")
-        vis_dir.mkdir(exist_ok=True)
-
-        # Create heatmap
-        heatmap_path = vis_dir / f"rf_heatmap_epoch_{epoch}.png"
-        create_rf_heatmap(
-            rf_stats['per_rf_similarities'],
-            self.compressed_grid_size,
-            save_path=str(heatmap_path),
-            title=f"RF Reconstruction Quality - Epoch {epoch}"
-        )
-
-        # Visualize specific RFs (best, worst, median)
-        similarities = rf_stats['per_rf_similarities']
-        best_idx = similarities.index(max(similarities))
-        worst_idx = similarities.index(min(similarities))
-        median_idx = sorted(range(len(similarities)), key=lambda i: similarities[i])[len(similarities)//2]
-
-        for label, idx in [('best', best_idx), ('worst', worst_idx), ('median', median_idx)]:
-            viz_path = vis_dir / f"rf_{label}_epoch_{epoch}_idx_{idx}.png"
-            visualize_rf_reconstruction(
-                original_tokens,
-                compressed_tokens,
-                reconstructed_rfs,
-                compressed_idx=idx,
-                save_path=str(viz_path)
-            )
-
-        if self.use_wandb:
-            # Log images to wandb
-            wandb.log({
-                f"val/rf_heatmap": wandb.Image(str(heatmap_path)),
-                f"val/rf_best": wandb.Image(str(vis_dir / f"rf_best_epoch_{epoch}_idx_{best_idx}.png")),
-                f"val/rf_worst": wandb.Image(str(vis_dir / f"rf_worst_epoch_{epoch}_idx_{worst_idx}.png")),
-                "epoch": epoch
-            })
 
     def save_checkpoint(
         self,
@@ -389,7 +321,6 @@ class RFTokenCompressionTrainer:
             'global_step': self.global_step,
             'compressor_state_dict': self.compressor.state_dict(),
             'rf_discriminator_state_dict': self.rf_discriminator.state_dict(),
-            'rf_ae_decoder_state_dict': self.rf_ae_decoder.state_dict(),
             'optimizer_G_state_dict': self.optimizer_G.state_dict(),
             'optimizer_D_state_dict': self.optimizer_D.state_dict(),
             'compressed_grid_size': self.compressed_grid_size,
@@ -417,7 +348,6 @@ class RFTokenCompressionTrainer:
 
         self.compressor.load_state_dict(checkpoint['compressor_state_dict'])
         self.rf_discriminator.load_state_dict(checkpoint['rf_discriminator_state_dict'])
-        self.rf_ae_decoder.load_state_dict(checkpoint['rf_ae_decoder_state_dict'])
         self.optimizer_G.load_state_dict(checkpoint['optimizer_G_state_dict'])
         self.optimizer_D.load_state_dict(checkpoint['optimizer_D_state_dict'])
 

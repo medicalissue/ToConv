@@ -154,7 +154,7 @@ class TokenCompressor(nn.Module):
             f"Expected {self.input_grid_size}^2 patches, got {num_patches}"
 
         # (B, N, C) -> (B, H, W, C) -> (B, C, H, W)
-        tokens_2d = tokens.view(batch_size, grid_size, grid_size, hidden_dim)
+        tokens_2d = tokens.reshape(batch_size, grid_size, grid_size, hidden_dim)
         tokens_2d = tokens_2d.permute(0, 3, 1, 2)
 
         return tokens_2d
