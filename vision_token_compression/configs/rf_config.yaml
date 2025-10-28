@@ -42,7 +42,7 @@ training:
   batch_size: 256
   learning_rate: 1e-4
   discriminator_lr: 1e-4
-  n_critic: 2  # Number of discriminator updates per generator update
+  n_critic: 1  # Number of discriminator updates per generator update (1:1 for speed)
 
   # Optimizer settings
   optimizer:
@@ -72,7 +72,7 @@ data:
 # Hardware settings
 hardware:
   cuda_device: 0  # CUDA device number
-  mixed_precision: false  # Use automatic mixed precision (experimental)
+  mixed_precision: true  # Use automatic mixed precision for 1.5-2x speedup
   compile: false  # Use torch.compile (requires PyTorch 2.0+)
 
 # Checkpoint settings

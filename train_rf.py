@@ -165,6 +165,8 @@ class RFTokenCompressionTrainer:
             # Extract CLIP tokens (no gradient)
             with torch.no_grad():
                 original_tokens = self.clip_encoder(images)
+                # Generate compressed tokens once (cache for all discriminator updates)
+                compressed_tokens_cached = self.compressor(original_tokens)
 
             # ============================================
             # Train Discriminator (n_critic iterations)
@@ -172,12 +174,9 @@ class RFTokenCompressionTrainer:
             for _ in range(self.n_critic):
                 self.optimizer_D.zero_grad(set_to_none=True)
 
-                with torch.no_grad():
-                    compressed_tokens = self.compressor(original_tokens)
-
                 with autocast(enabled=self.use_amp):
                     disc_loss, disc_info = self.wgan_loss.discriminator_loss(
-                        compressed_tokens=compressed_tokens,
+                        compressed_tokens=compressed_tokens_cached,
                         original_tokens=original_tokens,
                         discriminator=self.discriminator,
                         compressed_grid_size=self.compressed_grid_size,
@@ -204,12 +203,14 @@ class RFTokenCompressionTrainer:
                     discriminator=self.discriminator
                 )
 
-                # Cosine similarity loss
+                # Cosine similarity loss (compute stats only when logging)
+                should_log = (self.global_step % self.cfg.logging.log_frequency == 0)
                 cosine_loss, cosine_info = self.cosine_loss(
                     compressed_tokens=compressed_tokens,
                     original_tokens=original_tokens,
                     compressed_grid_size=(self.compressed_grid_size, self.compressed_grid_size),
-                    original_grid_size=(self.original_grid_size, self.original_grid_size)
+                    original_grid_size=(self.original_grid_size, self.original_grid_size),
+                    compute_stats=should_log
                 )
 
                 # Combined loss
@@ -237,7 +238,7 @@ class RFTokenCompressionTrainer:
             # ============================================
             # Logging
             # ============================================
-            if self.use_wandb and self.global_step % self.cfg.logging.log_frequency == 0:
+            if self.use_wandb and should_log:
                 wandb.log({
                     'train/disc_loss': disc_info['disc_loss'],
                     'train/disc_real': disc_info.get('disc_real_mean', 0.0),

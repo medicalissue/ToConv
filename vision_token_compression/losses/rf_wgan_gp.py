@@ -151,6 +151,7 @@ def sample_rf_tokens(
 ) -> torch.Tensor:
     """
     For each compressed token position, randomly sample 1 token from its RF.
+    Fully vectorized version without Python loops.
 
     Args:
         original_tokens: (B, original_grid_size², hidden_dim) - full-resolution grid
@@ -163,33 +164,70 @@ def sample_rf_tokens(
     batch_size = original_tokens.shape[0]
     hidden_dim = original_tokens.shape[2]
     rf_size = original_grid_size // compressed_grid_size
+    num_compressed = compressed_grid_size * compressed_grid_size
+    rf_area = rf_size * rf_size
 
-    sampled_tokens = []
+    # Reshape original tokens to 2D grid
+    # (B, H*W, D) -> (B, H, W, D)
+    original_grid = original_tokens.reshape(batch_size, original_grid_size, original_grid_size, hidden_dim)
 
-    for i in range(compressed_grid_size):
-        for j in range(compressed_grid_size):
-            # Get RF region indices for this compressed token
-            start_i = i * rf_size
-            start_j = j * rf_size
+    # Create meshgrid for compressed positions
+    # comp_i, comp_j: (compressed_grid_size, compressed_grid_size) each
+    comp_i, comp_j = torch.meshgrid(
+        torch.arange(compressed_grid_size, device=device),
+        torch.arange(compressed_grid_size, device=device),
+        indexing='ij'
+    )
+    comp_i = comp_i.reshape(-1)  # (k²,)
+    comp_j = comp_j.reshape(-1)  # (k²,)
 
-            # Collect RF token indices for this RF
-            rf_indices = []
-            for di in range(rf_size):
-                for dj in range(rf_size):
-                    idx = (start_i + di) * original_grid_size + (start_j + dj)
-                    rf_indices.append(idx)
+    # Create relative RF offset meshgrid
+    # rf_i, rf_j: (rf_size, rf_size) each
+    rf_i, rf_j = torch.meshgrid(
+        torch.arange(rf_size, device=device),
+        torch.arange(rf_size, device=device),
+        indexing='ij'
+    )
+    rf_i = rf_i.reshape(-1)  # (rf_size²,)
+    rf_j = rf_j.reshape(-1)  # (rf_size²,)
 
-            # Extract RF tokens: (B, rf_size², hidden_dim)
-            rf_tokens = original_tokens[:, rf_indices, :]
+    # Compute all RF indices for all compressed positions
+    # Shape: (k², rf_size²)
+    start_i = (comp_i * rf_size).unsqueeze(1)  # (k², 1)
+    start_j = (comp_j * rf_size).unsqueeze(1)  # (k², 1)
 
-            # Randomly sample 1 token from the RF tokens for each batch item
-            rand_idx = torch.randint(0, rf_size * rf_size, (batch_size,), device=device)
-            sampled = rf_tokens[torch.arange(batch_size, device=device), rand_idx, :]  # (B, 1024)
+    all_i = start_i + rf_i.unsqueeze(0)  # (k², rf_size²)
+    all_j = start_j + rf_j.unsqueeze(0)  # (k², rf_size²)
 
-            sampled_tokens.append(sampled)
+    # Extract all RF tokens for all compressed positions
+    # Use advanced indexing: (B, k², rf_size², D)
+    # Need to expand batch dimension
+    batch_idx = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
+    comp_idx = torch.arange(num_compressed, device=device).view(1, num_compressed, 1)
+    rf_idx = torch.arange(rf_area, device=device).view(1, 1, rf_area)
 
-    # Stack: List of k² × (B, hidden_dim) → (B, k², hidden_dim)
-    sampled_tokens = torch.stack(sampled_tokens, dim=1)
+    # Gather all RF tokens: (B, k², rf_size², D)
+    all_rf_tokens = original_grid[
+        batch_idx,
+        all_i.unsqueeze(0).expand(batch_size, -1, -1),
+        all_j.unsqueeze(0).expand(batch_size, -1, -1),
+        :
+    ]
+
+    # Randomly sample 1 token from each RF for each batch
+    # rand_idx: (B, k²) with values in [0, rf_size²)
+    rand_idx = torch.randint(0, rf_area, (batch_size, num_compressed), device=device)
+
+    # Gather sampled tokens: (B, k², D)
+    batch_idx_gather = torch.arange(batch_size, device=device).view(batch_size, 1, 1)
+    comp_idx_gather = torch.arange(num_compressed, device=device).view(1, num_compressed, 1)
+
+    sampled_tokens = all_rf_tokens[
+        batch_idx_gather,
+        comp_idx_gather,
+        rand_idx.unsqueeze(-1),
+        :
+    ].squeeze(2)
 
     return sampled_tokens
 

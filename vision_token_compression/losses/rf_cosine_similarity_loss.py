@@ -31,7 +31,8 @@ class RFCosineSimilarityLoss(nn.Module):
         compressed_tokens: torch.Tensor,
         original_tokens: torch.Tensor,
         compressed_grid_size: Tuple[int, int] = (6, 6),
-        original_grid_size: Tuple[int, int] = (24, 24)
+        original_grid_size: Tuple[int, int] = (24, 24),
+        compute_stats: bool = True
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute cosine similarity loss between compressed tokens and their RFs.
@@ -61,28 +62,22 @@ class RFCosineSimilarityLoss(nn.Module):
         # (B, 576, 1024) -> (B, 24, 24, 1024)
         original_grid = original_tokens.reshape(batch_size, orig_h, orig_w, hidden_dim)
 
-        # Extract RF tokens for each compressed position
-        # Shape: (B, 36, 16, 1024)
-        rf_tokens = []
+        # Vectorized RF extraction using unfold
+        # Unfold extracts sliding windows without loops
+        # Reshape to (B, D, H, W) for unfold
+        original_grid_transposed = original_grid.permute(0, 3, 1, 2)  # (B, 1024, 24, 24)
 
-        for i in range(comp_h):  # 6
-            for j in range(comp_w):  # 6
-                # Calculate RF boundaries in original grid
-                start_h = i * rf_h
-                end_h = start_h + rf_h
-                start_w = j * rf_w
-                end_w = start_w + rf_w
+        # Use unfold to extract all RFs at once
+        # unfold(dim, size, step) extracts windows
+        # dim=2 (height), size=rf_h, step=rf_h (non-overlapping)
+        rf_unfolded = original_grid_transposed.unfold(2, rf_h, rf_h)  # (B, D, comp_h, W, rf_h)
+        rf_unfolded = rf_unfolded.unfold(3, rf_w, rf_w)  # (B, D, comp_h, comp_w, rf_h, rf_w)
 
-                # Extract RF region: (B, 4, 4, 1024)
-                rf_region = original_grid[:, start_h:end_h, start_w:end_w, :]
+        # Rearrange to (B, comp_h, comp_w, rf_h, rf_w, D)
+        rf_unfolded = rf_unfolded.permute(0, 2, 3, 4, 5, 1)
 
-                # Flatten RF: (B, 16, 1024)
-                rf_flat = rf_region.reshape(batch_size, rf_size, hidden_dim)
-
-                rf_tokens.append(rf_flat)
-
-        # Stack all RFs: (B, 36, 16, 1024)
-        rf_tokens = torch.stack(rf_tokens, dim=1)
+        # Reshape to (B, comp_h*comp_w, rf_h*rf_w, D) = (B, 36, 16, 1024)
+        rf_tokens = rf_unfolded.reshape(batch_size, comp_h * comp_w, rf_size, hidden_dim)
 
         # Normalize tokens for cosine similarity
         # Compressed: (B, 36, 1024)
@@ -113,27 +108,36 @@ class RFCosineSimilarityLoss(nn.Module):
         # Loss is negative similarity (we want to maximize similarity)
         loss = -mean_similarity
 
-        # Compute additional statistics
-        min_similarity = similarities.min().item()
-        max_similarity = similarities.max().item()
-        std_similarity = similarities.std().item()
+        # Lazy statistics computation (only when needed for logging)
+        if compute_stats:
+            min_similarity = similarities.min().item()
+            max_similarity = similarities.max().item()
+            std_similarity = similarities.std().item()
+            min_per_token = avg_similarity_per_token.min().item()
+            max_per_token = avg_similarity_per_token.max().item()
+            std_per_token = avg_similarity_per_token.std().item()
 
-        # Per-token statistics
-        min_per_token = avg_similarity_per_token.min().item()
-        max_per_token = avg_similarity_per_token.max().item()
-        std_per_token = avg_similarity_per_token.std().item()
-
-        info_dict = {
-            'cosine_sim_loss': loss.item(),
-            'mean_similarity': mean_similarity.item(),
-            'min_similarity': min_similarity,
-            'max_similarity': max_similarity,
-            'std_similarity': std_similarity,
-            'min_per_token': min_per_token,
-            'max_per_token': max_per_token,
-            'std_per_token': std_per_token,
-            'temperature': self.temperature
-        }
+            info_dict = {
+                'cosine_sim_loss': loss.item(),
+                'mean_similarity': mean_similarity.item(),
+                'min_similarity': min_similarity,
+                'max_similarity': max_similarity,
+                'std_similarity': std_similarity,
+                'min_per_token': min_per_token,
+                'max_per_token': max_per_token,
+                'std_per_token': std_per_token,
+                'temperature': self.temperature
+            }
+        else:
+            # Skip expensive statistics, only return essentials
+            info_dict = {
+                'cosine_sim_loss': loss.item(),
+                'mean_similarity': mean_similarity.item(),
+                'min_similarity': 0.0,  # Placeholder
+                'max_similarity': 0.0,  # Placeholder
+                'std_similarity': 0.0,  # Placeholder
+                'temperature': self.temperature
+            }
 
         return loss, info_dict
 
