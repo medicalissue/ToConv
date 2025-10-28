@@ -5,20 +5,18 @@ experiment:
   seed: 42
   use_wandb: true
   wandb_project: "rf-vision-token-compression"
-  wandb_entity: null  # Set your wandb entity here
+  wandb_entity: medicalissues  # Set your wandb entity here
 
 # Model settings
 model:
   clip:
-    model_name: "openai/clip-vit-large-patch14-336"
+    model_name: "openai/clip-vit-large-patch14" #-336
     freeze: true
-    image_size: 336
+    image_size: 224 #336
 
   compressor:
-    output_grid_size: 6  # Compress to 6x6 grid (36 tokens)
-    num_layers: 3
-    use_residual: true
-    use_layer_norm: true
+    output_grid_size: 8  # Compress to 6x6 grid (36 tokens)
+    bottleneck_dim: 256  # Hidden dimension for compression (256/512/1024)
 
   rf_discriminator:
     # Processes single tokens (B*36, 1024)
@@ -41,10 +39,10 @@ loss:
 # Training settings
 training:
   epochs: 100
-  batch_size: 32
+  batch_size: 256
   learning_rate: 1e-4
   discriminator_lr: 1e-4
-  n_critic: 5  # Number of discriminator updates per generator update
+  n_critic: 2  # Number of discriminator updates per generator update
 
   # Optimizer settings
   optimizer:
@@ -55,18 +53,17 @@ training:
   scheduler:
     use: false
     type: "cosine"
-    warmup_epochs: 5
+    warmup_epochs: 3
     min_lr: 1e-6
 
 # Grid settings
 grid:
   original_grid_size: 24  # 24×24 = 576 tokens from CLIP
-  compressed_grid_size: 6  # 6×6 = 36 compressed tokens
-  rf_size: 4  # 4×4 = 16 tokens per receptive field
+  compressed_grid_size: 8  # 6×6 = 36 compressed tokens
 
 # Data settings
 data:
-  imagenet_root: "/path/to/imagenet"  # UPDATE THIS PATH
+  imagenet_root: "/home/elicer/ImageNet"  # UPDATE THIS PATH
   num_workers: 4
   pin_memory: true
   use_subset: false  # Set to true for quick testing
@@ -93,7 +90,5 @@ validation:
 
 # Logging settings
 logging:
-  log_frequency: 100  # Log every N steps
+  log_frequency: 50  # Log to wandb every N steps
   print_frequency: 10  # Print to console every N steps
-  log_rf_heatmap: true  # Log RF similarity heatmap
-  log_rf_distribution: true  # Log distribution of RF qualities

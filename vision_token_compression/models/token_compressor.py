@@ -1,4 +1,4 @@
-"""2D Convolution-based Token Compressor"""
+"""Simple 1-Layer Convolution-based Token Compressor"""
 import torch
 import torch.nn as nn
 import math
@@ -6,128 +6,100 @@ import math
 
 class TokenCompressor(nn.Module):
     """
-    2D Convolution-based token compressor that reduces spatial resolution
-    while preserving local token relationships.
+    Simple 1-layer convolution-based token compressor.
 
-    Converts a grid of tokens from (grid_size x grid_size) to (k x k).
+    Uses a single stride-2 convolution followed by adaptive pooling
+    to compress tokens to target grid size.
     """
 
     def __init__(
         self,
         input_grid_size: int,
         output_grid_size: int,
-        hidden_dim: int,
-        num_layers: int = 3,
-        use_residual: bool = True,
-        use_layer_norm: bool = True
+        hidden_dim: int = 1024,
+        bottleneck_dim: int = 512
     ):
         """
         Args:
             input_grid_size: Size of input token grid (e.g., 24 for 24x24)
-            output_grid_size: Size of output token grid (k for kxk)
-            hidden_dim: Hidden dimension of tokens (e.g., 1024 for CLIP ViT-L)
-            num_layers: Number of convolutional layers
-            use_residual: Whether to use residual connections
-            use_layer_norm: Whether to use layer normalization
+            output_grid_size: Size of output token grid (e.g., 6 for 6x6)
+            hidden_dim: Token dimension (e.g., 1024 for CLIP ViT-L)
+            bottleneck_dim: Hidden dimension for compression (configurable)
         """
         super().__init__()
 
         self.input_grid_size = input_grid_size
         self.output_grid_size = output_grid_size
         self.hidden_dim = hidden_dim
-        self.use_residual = use_residual
+        self.bottleneck_dim = bottleneck_dim
 
-        # Calculate total compression ratio
-        self.compression_ratio = input_grid_size / output_grid_size
+        # Compression ratio
+        self.compression_ratio = (input_grid_size ** 2) / (output_grid_size ** 2)
 
-        # Build the compression network
-        self.layers = nn.ModuleList()
+        # Single stride-2 convolution for initial compression
+        self.compress_conv = nn.Sequential(
+            nn.Conv2d(
+                hidden_dim,
+                bottleneck_dim,
+                kernel_size=3,
+                stride=2,
+                padding=1,
+                bias=False
+            ),
+            nn.GroupNorm(32, bottleneck_dim),
+            nn.GELU()
+        )
 
-        # Calculate per-layer downsampling
-        # We'll use strided convolutions to gradually reduce spatial dimensions
-        current_size = input_grid_size
-
-        for i in range(num_layers):
-            # Calculate the stride for this layer
-            if i == num_layers - 1:
-                # Last layer: ensure we reach exact output size
-                stride = current_size // output_grid_size
-                kernel_size = stride + (stride % 2)  # Ensure odd kernel size
-            else:
-                # Intermediate layers: gradual downsampling
-                target_size = int(current_size / (self.compression_ratio ** (1 / num_layers)))
-                stride = max(1, current_size // target_size)
-                kernel_size = stride + (stride % 2)
-
-            # Ensure kernel size is at least 3 and odd
-            kernel_size = max(3, kernel_size)
-            if kernel_size % 2 == 0:
-                kernel_size += 1
-
-            padding = kernel_size // 2
-
-            layer_modules = []
-
-            # Convolutional layer
-            layer_modules.append(
-                nn.Conv2d(
-                    hidden_dim,
-                    hidden_dim,
-                    kernel_size=kernel_size,
-                    stride=stride,
-                    padding=padding,
-                    bias=not use_layer_norm
-                )
-            )
-
-            # Layer normalization (applied per spatial position)
-            if use_layer_norm:
-                layer_modules.append(nn.GroupNorm(32, hidden_dim))
-
-            # Activation
-            if i < num_layers - 1:  # No activation on last layer
-                layer_modules.append(nn.GELU())
-
-            self.layers.append(nn.Sequential(*layer_modules))
-
-            # Update current size
-            current_size = (current_size + 2 * padding - kernel_size) // stride + 1
-
-        # Adaptive pooling to ensure exact output size
+        # Adaptive pooling to exact output size
         self.adaptive_pool = nn.AdaptiveAvgPool2d((output_grid_size, output_grid_size))
 
-        # Optional: learnable position embeddings for output tokens
+        # Project back to original dimension
+        self.project = nn.Conv2d(
+            bottleneck_dim,
+            hidden_dim,
+            kernel_size=1,
+            bias=True
+        )
+
+        # Learnable position embeddings for output tokens
         self.pos_embed = nn.Parameter(
             torch.randn(1, hidden_dim, output_grid_size, output_grid_size) * 0.02
         )
 
+        # Store layer info for RF calculation
+        self.layer_info = [{
+            'kernel_size': 3,
+            'stride': 2,
+            'padding': 1
+        }]
+
+        # Calculate receptive field
+        self.receptive_field_size = self._calculate_receptive_field()
+
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """
-        Compress tokens using 2D convolutions.
+        Compress tokens.
 
         Args:
             tokens: Input tokens of shape (batch_size, num_patches, hidden_dim)
                    where num_patches = input_grid_size^2
 
         Returns:
-            Compressed tokens of shape (batch_size, k^2, hidden_dim)
-            where k = output_grid_size
+            Compressed tokens of shape (batch_size, output_grid_size^2, hidden_dim)
         """
         batch_size = tokens.shape[0]
 
-        # Reshape tokens to 2D grid: (B, N, C) -> (B, C, H, W)
+        # Reshape to 2D grid: (B, N, C) -> (B, C, H, W)
         tokens_2d = self._to_2d(tokens)
 
-        # Apply convolutional layers
-        x = tokens_2d
-        for layer in self.layers:
-            if self.use_residual and x.shape == layer(x).shape:
-                x = x + layer(x)
-            else:
-                x = layer(x)
+        # Compress
+        x = self.compress_conv(tokens_2d)  # (B, bottleneck_dim, H/2, W/2)
 
-        # Ensure exact output size with adaptive pooling
-        x = self.adaptive_pool(x)
+        # Adaptive pool to exact size
+        x = self.adaptive_pool(x)  # (B, bottleneck_dim, output_h, output_w)
+
+        # Project back to original dimension
+        x = self.project(x)  # (B, hidden_dim, output_h, output_w)
 
         # Add positional embeddings
         x = x + self.pos_embed
@@ -177,55 +149,103 @@ class TokenCompressor(nn.Module):
 
         return tokens
 
-    def get_receptive_field_mapping(self) -> torch.Tensor:
+    def _calculate_receptive_field(self) -> int:
         """
-        Compute which input tokens correspond to each output token.
+        Calculate the theoretical receptive field size.
+
+        For single stride-2, kernel-3 layer:
+        RF = 1 + (kernel_size - 1) * 1 = 1 + 2 = 3
 
         Returns:
-            Mapping tensor for receptive field computation
+            Receptive field size (height/width in original grid)
         """
-        # Each output token has a receptive field in the input
-        # This is useful for the autoencoder loss
-        rf_size = self.input_grid_size // self.output_grid_size
+        rf = 1
+        jump = 1
 
-        # Create mapping: (k, k, rf_size, rf_size)
-        # For each output position (i, j), get input positions
-        mapping = torch.zeros(
-            self.output_grid_size,
-            self.output_grid_size,
-            rf_size,
-            rf_size,
-            dtype=torch.long
+        for layer_info in reversed(self.layer_info):
+            kernel_size = layer_info['kernel_size']
+            stride = layer_info['stride']
+            rf = rf + (kernel_size - 1) * jump
+            jump = jump * stride
+
+        return rf
+
+    def get_receptive_field_size(self) -> int:
+        """
+        Get the receptive field size of the compressor.
+
+        Returns:
+            Receptive field size (each output token sees an RF×RF region in input)
+        """
+        return self.receptive_field_size
+
+    def get_effective_receptive_field_mapping(self) -> torch.Tensor:
+        """
+        Compute which input tokens correspond to each output token's effective RF.
+
+        Due to adaptive pooling, each output position corresponds to a
+        grid-aligned region in the input.
+
+        Returns:
+            Mapping tensor: (output_grid_size, output_grid_size, rf_size, rf_size)
+            containing input token indices for each output position
+        """
+        # Calculate stride in input grid
+        stride = self.input_grid_size / self.output_grid_size
+
+        # RF size in grid units
+        rf_size = int(stride)
+
+        # Create coordinate grids
+        output_i, output_j = torch.meshgrid(
+            torch.arange(self.output_grid_size),
+            torch.arange(self.output_grid_size),
+            indexing='ij'
         )
 
-        for i in range(self.output_grid_size):
-            for j in range(self.output_grid_size):
-                # Input region corresponding to output position (i, j)
-                start_i = i * rf_size
-                start_j = j * rf_size
+        di, dj = torch.meshgrid(
+            torch.arange(rf_size),
+            torch.arange(rf_size),
+            indexing='ij'
+        )
 
-                for di in range(rf_size):
-                    for dj in range(rf_size):
-                        input_i = start_i + di
-                        input_j = start_j + dj
-                        input_idx = input_i * self.input_grid_size + input_j
-                        mapping[i, j, di, dj] = input_idx
+        # Compute starting positions for each output token
+        start_i = (output_i.float() * stride).long().unsqueeze(-1).unsqueeze(-1)
+        start_j = (output_j.float() * stride).long().unsqueeze(-1).unsqueeze(-1)
 
-        return mapping
+        # Expand relative positions
+        di_expanded = di.unsqueeze(0).unsqueeze(0)
+        dj_expanded = dj.unsqueeze(0).unsqueeze(0)
+
+        # Compute absolute input positions
+        input_i = start_i + di_expanded
+        input_j = start_j + dj_expanded
+
+        # Clamp to bounds
+        input_i = torch.clamp(input_i, 0, self.input_grid_size - 1)
+        input_j = torch.clamp(input_j, 0, self.input_grid_size - 1)
+
+        # Convert to linear indices
+        mapping = input_i * self.input_grid_size + input_j
+
+        return mapping.long()
 
 
 if __name__ == "__main__":
-    # Test the compressor
+    # Test the simplified compressor
+    print("Testing simplified Token Compressor...")
+
     batch_size = 4
-    input_grid_size = 24  # 24x24 grid for ViT-L/14@336px
-    output_grid_size = 6  # Compress to 6x6 grid
-    hidden_dim = 1024  # CLIP ViT-L hidden dimension
+    input_grid_size = 24
+    output_grid_size = 6
+    hidden_dim = 1024
+    bottleneck_dim = 512
 
     compressor = TokenCompressor(
         input_grid_size=input_grid_size,
         output_grid_size=output_grid_size,
         hidden_dim=hidden_dim,
-        num_layers=3
+        bottleneck_dim=bottleneck_dim
     )
 
     # Test forward pass
@@ -235,10 +255,20 @@ if __name__ == "__main__":
 
     print(f"Input shape: {dummy_tokens.shape}")
     print(f"Output shape: {compressed.shape}")
+    print(f"Compression ratio: {input_grid_size**2 / output_grid_size**2:.1f}x")
+    print(f"Bottleneck dim: {bottleneck_dim}")
     assert compressed.shape == (batch_size, output_grid_size ** 2, hidden_dim)
 
-    # Test receptive field mapping
-    rf_mapping = compressor.get_receptive_field_mapping()
-    print(f"Receptive field mapping shape: {rf_mapping.shape}")
+    # Test receptive field
+    theoretical_rf = compressor.get_receptive_field_size()
+    print(f"Theoretical receptive field: {theoretical_rf}×{theoretical_rf}")
 
-    print("✓ Token Compressor test passed!")
+    rf_mapping = compressor.get_effective_receptive_field_mapping()
+    print(f"Effective RF mapping shape: {rf_mapping.shape}")
+    print(f"Effective RF size per output: {rf_mapping.shape[2]}×{rf_mapping.shape[3]}")
+
+    # Count parameters
+    total_params = sum(p.numel() for p in compressor.parameters())
+    print(f"Total parameters: {total_params / 1e6:.2f}M")
+
+    print("✓ Simplified Token Compressor test passed!")
