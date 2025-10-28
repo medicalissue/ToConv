@@ -100,9 +100,7 @@ class RFTokenCompressionTrainer:
 
         # Build losses
         self.wgan_loss = RFWGANGPLoss(lambda_gp=cfg.loss.rf_wgan.lambda_gp)
-        self.cosine_loss = RFCosineSimilarityLoss(
-            temperature=cfg.loss.rf_cosine_similarity.temperature
-        )
+        self.cosine_loss = RFCosineSimilarityLoss()
 
         self.wgan_weight = cfg.loss.weights.wgan
         self.cosine_weight = cfg.loss.weights.cosine

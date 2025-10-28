@@ -28,7 +28,8 @@ loss:
     lambda_gp: 10.0  # Gradient penalty weight
 
   rf_cosine_similarity:
-    temperature: 0.07  # Temperature for similarity scaling
+    # Loss = 1 - mean_similarity (range: 0 to 2)
+    # No additional parameters needed
 
   weights:
     wgan: 1.0      # Weight for WGAN-GP loss

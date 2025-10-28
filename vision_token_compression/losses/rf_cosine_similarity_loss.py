@@ -16,15 +16,11 @@ class RFCosineSimilarityLoss(nn.Module):
     Cosine Similarity Loss for Receptive Field Token Compression.
 
     For each compressed token, computes cosine similarity with all tokens in its
-    corresponding receptive field and maximizes the average similarity.
-
-    Args:
-        temperature: Temperature parameter for scaling similarities (default: 0.07)
+    corresponding receptive field. Loss = 1 - mean_similarity (range: 0 to 2).
     """
 
-    def __init__(self, temperature: float = 0.07):
+    def __init__(self):
         super().__init__()
-        self.temperature = temperature
 
     def forward(
         self,
@@ -96,17 +92,17 @@ class RFCosineSimilarityLoss(nn.Module):
         # (B, 36, 1, 1024) * (B, 36, 16, 1024) -> (B, 36, 16)
         similarities = (compressed_expanded * rf_norm).sum(dim=-1)  # (B, 36, 16)
 
-        # Apply temperature scaling
-        similarities = similarities / self.temperature
-
         # Average similarity per compressed token: (B, 36)
         avg_similarity_per_token = similarities.mean(dim=-1)
 
-        # Overall average similarity: scalar
+        # Overall average similarity: scalar (range: -1 to 1)
         mean_similarity = avg_similarity_per_token.mean()
 
-        # Loss is negative similarity (we want to maximize similarity)
-        loss = -mean_similarity
+        # Loss: 1 - similarity (range: 0 to 2, lower is better)
+        # Perfect similarity (1.0) → loss = 0
+        # No correlation (0.0) → loss = 1
+        # Opposite (-1.0) → loss = 2
+        loss = 1 - mean_similarity
 
         # Lazy statistics computation (only when needed for logging)
         if compute_stats:
@@ -125,8 +121,7 @@ class RFCosineSimilarityLoss(nn.Module):
                 'std_similarity': std_similarity,
                 'min_per_token': min_per_token,
                 'max_per_token': max_per_token,
-                'std_per_token': std_per_token,
-                'temperature': self.temperature
+                'std_per_token': std_per_token
             }
         else:
             # Skip expensive statistics, only return essentials
@@ -135,8 +130,7 @@ class RFCosineSimilarityLoss(nn.Module):
                 'mean_similarity': mean_similarity.item(),
                 'min_similarity': 0.0,  # Placeholder
                 'max_similarity': 0.0,  # Placeholder
-                'std_similarity': 0.0,  # Placeholder
-                'temperature': self.temperature
+                'std_similarity': 0.0   # Placeholder
             }
 
         return loss, info_dict
