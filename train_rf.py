@@ -101,7 +101,12 @@ class RFTokenCompressionTrainer:
             threshold=cfg.loss.sinkhorn_ot.threshold,
             normalize=cfg.loss.sinkhorn_ot.normalize
         )
-        self.cosine_loss = RFCosineSimilarityLoss()
+        # Pass actual convolution parameters to RF cosine loss
+        self.cosine_loss = RFCosineSimilarityLoss(
+            kernel_size=self.compressor.kernel_size,
+            stride=self.compressor.stride,
+            padding=self.compressor.padding
+        )
 
         self.ot_weight = cfg.loss.weights.sinkhorn_ot
         self.cosine_weight = cfg.loss.weights.cosine

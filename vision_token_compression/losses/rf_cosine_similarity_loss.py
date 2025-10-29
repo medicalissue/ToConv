@@ -17,10 +17,22 @@ class RFCosineSimilarityLoss(nn.Module):
 
     For each compressed token, computes cosine similarity with all tokens in its
     corresponding receptive field. Loss = 1 - mean_similarity (range: 0 to 2).
+
+    Uses actual convolution parameters (kernel_size, stride, padding) to compute
+    the exact receptive field for each compressed token.
     """
 
-    def __init__(self):
+    def __init__(self, kernel_size: int = 4, stride: int = 4, padding: int = 0):
+        """
+        Args:
+            kernel_size: Convolution kernel size (determines RF size)
+            stride: Convolution stride (determines RF spacing)
+            padding: Convolution padding (affects RF positioning)
+        """
         super().__init__()
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
 
     def forward(
         self,
@@ -34,13 +46,14 @@ class RFCosineSimilarityLoss(nn.Module):
         Compute cosine similarity loss between compressed tokens and their RFs.
 
         Args:
-            compressed_tokens: (B, 36, 1024) - Compressed token grid
-            original_tokens: (B, 576, 1024) - Original token grid from CLIP
-            compressed_grid_size: Size of compressed grid (6, 6)
-            original_grid_size: Size of original grid (24, 24)
+            compressed_tokens: (B, comp_h*comp_w, hidden_dim) - Compressed token grid
+            original_tokens: (B, orig_h*orig_w, hidden_dim) - Original token grid from CLIP
+            compressed_grid_size: Size of compressed grid (e.g., (12, 12))
+            original_grid_size: Size of original grid (e.g., (24, 24))
+            compute_stats: Whether to compute detailed statistics
 
         Returns:
-            loss: Scalar loss tensor (negative mean similarity to maximize)
+            loss: Scalar loss tensor (1 - mean_similarity)
             info_dict: Dictionary with detailed metrics
         """
         batch_size = compressed_tokens.size(0)
@@ -49,51 +62,92 @@ class RFCosineSimilarityLoss(nn.Module):
         comp_h, comp_w = compressed_grid_size
         orig_h, orig_w = original_grid_size
 
-        # Calculate RF size
-        rf_h = orig_h // comp_h  # 4
-        rf_w = orig_w // comp_w  # 4
-        rf_size = rf_h * rf_w    # 16
-
-        # Reshape original tokens to 2D grid
-        # (B, 576, 1024) -> (B, 24, 24, 1024)
+        # Reshape original tokens to 2D grid: (B, N, D) -> (B, H, W, D)
         original_grid = original_tokens.reshape(batch_size, orig_h, orig_w, hidden_dim)
 
-        # Vectorized RF extraction using unfold
-        # Unfold extracts sliding windows without loops
-        # Reshape to (B, D, H, W) for unfold
-        original_grid_transposed = original_grid.permute(0, 3, 1, 2)  # (B, 1024, 24, 24)
+        # Extract RF tokens for each compressed position using actual conv parameters
+        rf_tokens_list = []
 
-        # Use unfold to extract all RFs at once
-        # unfold(dim, size, step) extracts windows
-        # dim=2 (height), size=rf_h, step=rf_h (non-overlapping)
-        rf_unfolded = original_grid_transposed.unfold(2, rf_h, rf_h)  # (B, D, comp_h, W, rf_h)
-        rf_unfolded = rf_unfolded.unfold(3, rf_w, rf_w)  # (B, D, comp_h, comp_w, rf_h, rf_w)
+        for i in range(comp_h):
+            for j in range(comp_w):
+                # Calculate RF bounds in original grid
+                # Conv formula: output_pos = (input_pos + padding - kernel_size) / stride + 1
+                # Inverse: input_start = output_pos * stride - padding
+                start_h = i * self.stride - self.padding
+                start_w = j * self.stride - self.padding
+                end_h = start_h + self.kernel_size
+                end_w = start_w + self.kernel_size
 
-        # Rearrange to (B, comp_h, comp_w, rf_h, rf_w, D)
-        rf_unfolded = rf_unfolded.permute(0, 2, 3, 4, 5, 1)
+                # Clamp to valid original grid range
+                start_h_clamped = max(0, start_h)
+                start_w_clamped = max(0, start_w)
+                end_h_clamped = min(orig_h, end_h)
+                end_w_clamped = min(orig_w, end_w)
 
-        # Reshape to (B, comp_h*comp_w, rf_h*rf_w, D) = (B, 36, 16, 1024)
-        rf_tokens = rf_unfolded.reshape(batch_size, comp_h * comp_w, rf_size, hidden_dim)
+                # Extract RF region: (B, rf_h, rf_w, D)
+                rf_region = original_grid[:, start_h_clamped:end_h_clamped,
+                                         start_w_clamped:end_w_clamped, :]
+
+                # Flatten RF: (B, rf_h * rf_w, D)
+                rf_flat = rf_region.reshape(batch_size, -1, hidden_dim)
+
+                rf_tokens_list.append(rf_flat)
+
+        # Stack all RFs: list of (B, rf_size, D) -> (B, comp_h*comp_w, rf_size, D)
+        # Note: rf_size may vary for boundary tokens, so we need to handle this
+        max_rf_size = max(rf.size(1) for rf in rf_tokens_list)
+
+        # Pad smaller RFs with zeros and create mask
+        rf_tokens_padded = []
+        rf_masks = []
+
+        for rf in rf_tokens_list:
+            current_rf_size = rf.size(1)
+            if current_rf_size < max_rf_size:
+                # Pad: (B, current_size, D) -> (B, max_size, D)
+                padding = torch.zeros(batch_size, max_rf_size - current_rf_size,
+                                     hidden_dim, device=rf.device, dtype=rf.dtype)
+                rf_padded = torch.cat([rf, padding], dim=1)
+                # Mask: 1 for valid tokens, 0 for padding
+                mask = torch.cat([torch.ones(current_rf_size, device=rf.device),
+                                 torch.zeros(max_rf_size - current_rf_size, device=rf.device)])
+            else:
+                rf_padded = rf
+                mask = torch.ones(max_rf_size, device=rf.device)
+
+            rf_tokens_padded.append(rf_padded)
+            rf_masks.append(mask)
+
+        # Stack: (B, comp_h*comp_w, max_rf_size, D)
+        rf_tokens = torch.stack(rf_tokens_padded, dim=1)
+        # Masks: (comp_h*comp_w, max_rf_size)
+        rf_masks = torch.stack(rf_masks, dim=0)
 
         # Normalize tokens for cosine similarity
-        # Compressed: (B, 36, 1024)
+        # Compressed: (B, comp_h*comp_w, D)
         compressed_norm = F.normalize(compressed_tokens, p=2, dim=-1)
 
-        # RF tokens: (B, 36, 16, 1024)
+        # RF tokens: (B, comp_h*comp_w, max_rf_size, D)
         rf_norm = F.normalize(rf_tokens, p=2, dim=-1)
 
         # Compute cosine similarity between each compressed token and its RF tokens
-        # compressed_norm: (B, 36, 1, 1024)
-        # rf_norm: (B, 36, 16, 1024)
-        # Result: (B, 36, 16) - similarity for each token in RF
-        compressed_expanded = compressed_norm.unsqueeze(2)  # (B, 36, 1, 1024)
+        # compressed_norm: (B, comp_h*comp_w, 1, D)
+        # rf_norm: (B, comp_h*comp_w, max_rf_size, D)
+        # Result: (B, comp_h*comp_w, max_rf_size) - similarity for each token in RF
+        compressed_expanded = compressed_norm.unsqueeze(2)  # (B, comp_h*comp_w, 1, D)
 
         # Compute dot product (cosine similarity since vectors are normalized)
-        # (B, 36, 1, 1024) * (B, 36, 16, 1024) -> (B, 36, 16)
-        similarities = (compressed_expanded * rf_norm).sum(dim=-1)  # (B, 36, 16)
+        similarities = (compressed_expanded * rf_norm).sum(dim=-1)  # (B, comp_h*comp_w, max_rf_size)
 
-        # Average similarity per compressed token: (B, 36)
-        avg_similarity_per_token = similarities.mean(dim=-1)
+        # Apply mask to ignore padded tokens
+        # rf_masks: (comp_h*comp_w, max_rf_size)
+        masked_similarities = similarities * rf_masks.unsqueeze(0)  # (B, comp_h*comp_w, max_rf_size)
+
+        # Average similarity per compressed token (only over valid tokens)
+        # Sum over RF dimension and divide by number of valid tokens
+        sum_per_token = masked_similarities.sum(dim=-1)  # (B, comp_h*comp_w)
+        count_per_token = rf_masks.sum(dim=-1)  # (comp_h*comp_w,)
+        avg_similarity_per_token = sum_per_token / count_per_token.unsqueeze(0)  # (B, comp_h*comp_w)
 
         # Overall average similarity: scalar (range: -1 to 1)
         mean_similarity = avg_similarity_per_token.mean()
@@ -106,9 +160,12 @@ class RFCosineSimilarityLoss(nn.Module):
 
         # Lazy statistics computation (only when needed for logging)
         if compute_stats:
-            min_similarity = similarities.min().item()
-            max_similarity = similarities.max().item()
-            std_similarity = similarities.std().item()
+            # Only compute stats on valid (non-masked) similarities
+            valid_similarities = masked_similarities[rf_masks.unsqueeze(0).expand_as(masked_similarities) > 0]
+            min_similarity = valid_similarities.min().item() if valid_similarities.numel() > 0 else 0.0
+            max_similarity = valid_similarities.max().item() if valid_similarities.numel() > 0 else 0.0
+            std_similarity = valid_similarities.std().item() if valid_similarities.numel() > 0 else 0.0
+
             min_per_token = avg_similarity_per_token.min().item()
             max_per_token = avg_similarity_per_token.max().item()
             std_per_token = avg_similarity_per_token.std().item()
