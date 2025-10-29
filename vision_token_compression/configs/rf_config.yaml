@@ -17,22 +17,19 @@ model:
   compressor:
     hidden_dim: 1024  # CLIP ViT-L token dimension
 
-  rf_discriminator:
-    # Fixed architecture: 1024 -> 512 -> 256 -> 1
-    # Processes single tokens (B*N, 1024) where N = output_grid_size^2
-    dropout: 0.1
-
 # Loss settings
 loss:
-  rf_wgan:
-    lambda_gp: 1.0  # Gradient penalty weight
+  mmd:
+    kernel_mul: 2.0  # Multiplier for bandwidth in multi-scale kernel
+    kernel_num: 5    # Number of kernels to use in multi-scale kernel
+    fix_sigma: null  # If provided, use fixed bandwidth. Otherwise, compute adaptively
 
   rf_cosine_similarity:
     # Loss = 1 - mean_similarity (range: 0 to 2)
     # No additional parameters needed
 
   weights:
-    wgan: 1.0      # Weight for WGAN-GP loss
+    mmd: 1.0       # Weight for MMD loss
     cosine: 1.0    # Weight for Cosine Similarity loss
 
 # Training settings
@@ -40,8 +37,6 @@ training:
   epochs: 100
   batch_size: 256
   learning_rate: 1e-4
-  discriminator_lr: 1e-4
-  n_critic: 2  # Number of discriminator updates per generator update (1:1 for speed)
 
   # Optimizer settings
   optimizer:

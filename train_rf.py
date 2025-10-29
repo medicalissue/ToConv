@@ -17,10 +17,9 @@ from typing import Dict, Optional
 
 from vision_token_compression.models import (
     CLIPVisionEncoder,
-    TokenCompressor,
-    RFDiscriminator
+    TokenCompressor
 )
-from vision_token_compression.losses import RFWGANGPLoss, RFCosineSimilarityLoss
+from vision_token_compression.losses import MMDLoss, RFCosineSimilarityLoss
 from vision_token_compression.data import create_imagenet_dataloaders
 
 
@@ -67,12 +66,6 @@ class RFTokenCompressionTrainer:
             hidden_dim=hidden_dim
         ).to(device)
 
-        # RF Discriminator (Fixed 1024->512->256->1)
-        self.discriminator = RFDiscriminator(
-            hidden_dim=hidden_dim,
-            dropout=cfg.model.rf_discriminator.dropout
-        ).to(device)
-
         # Print model info
         rf_size = self.compressor.get_receptive_field_size()
         input_size = cfg.compression.input_grid_size
@@ -88,39 +81,30 @@ class RFTokenCompressionTrainer:
         print(f"  - Theoretical RF: {rf_size}×{rf_size}")
         print(f"  - Params: {sum(p.numel() for p in self.compressor.parameters())/1e6:.2f}M")
 
-        print(f"\n✓ RF Discriminator")
-        print(f"  - Params: {sum(p.numel() for p in self.discriminator.parameters())/1e6:.2f}M")
-
-        total_params = (
-            sum(p.numel() for p in self.compressor.parameters()) +
-            sum(p.numel() for p in self.discriminator.parameters())
-        )
+        total_params = sum(p.numel() for p in self.compressor.parameters())
         print(f"\n✓ Total trainable params: {total_params/1e6:.2f}M")
 
         # Build losses
-        self.wgan_loss = RFWGANGPLoss(lambda_gp=cfg.loss.rf_wgan.lambda_gp)
+        self.mmd_loss = MMDLoss(
+            kernel_mul=cfg.loss.mmd.kernel_mul,
+            kernel_num=cfg.loss.mmd.kernel_num,
+            fix_sigma=cfg.loss.mmd.get('fix_sigma', None)
+        )
         self.cosine_loss = RFCosineSimilarityLoss()
 
-        self.wgan_weight = cfg.loss.weights.wgan
+        self.mmd_weight = cfg.loss.weights.mmd
         self.cosine_weight = cfg.loss.weights.cosine
 
-        # Optimizers
-        self.optimizer_G = torch.optim.Adam(
+        # Optimizer
+        self.optimizer = torch.optim.Adam(
             self.compressor.parameters(),
             lr=cfg.training.learning_rate,
             betas=tuple(cfg.training.optimizer.betas)
         )
 
-        self.optimizer_D = torch.optim.Adam(
-            self.discriminator.parameters(),
-            lr=cfg.training.discriminator_lr,
-            betas=tuple(cfg.training.optimizer.betas)
-        )
-
         # Mixed precision training
         self.use_amp = cfg.hardware.mixed_precision
-        self.scaler_G = GradScaler(enabled=self.use_amp)
-        self.scaler_D = GradScaler(enabled=self.use_amp)
+        self.scaler = GradScaler(enabled=self.use_amp)
 
         # Training state
         self.global_step = 0
@@ -130,30 +114,17 @@ class RFTokenCompressionTrainer:
         # Grid sizes for loss computation
         self.compressed_grid_size = cfg.compression.output_grid_size
         self.original_grid_size = cfg.compression.input_grid_size
-        self.n_critic = cfg.training.n_critic
 
     def train_epoch(self, train_loader, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
         self.compressor.train()
-        self.discriminator.train()
         self.clip_encoder.eval()
 
         # Accumulators
         metrics = {
-            'disc_loss': 0.0,
-            'wasserstein_dist': 0.0,
-            'grad_penalty': 0.0,
-            'real_score_mean': 0.0,
-            'fake_score_mean': 0.0,
-            'real_score_std': 0.0,
-            'fake_score_std': 0.0,
-            'gradient_norm_mean': 0.0,
-            'gradient_norm_std': 0.0,
-            'gradient_norm_min': 0.0,
-            'gradient_norm_max': 0.0,
-            'gen_loss': 0.0,
+            'mmd_loss': 0.0,
             'cosine_loss': 0.0,
-            'total_gen_loss': 0.0,
+            'total_loss': 0.0,
             'mean_similarity': 0.0,
             'min_similarity': 0.0,
             'max_similarity': 0.0
@@ -168,42 +139,22 @@ class RFTokenCompressionTrainer:
             # Extract CLIP tokens (no gradient)
             with torch.no_grad():
                 original_tokens = self.clip_encoder(images)
-                # Generate compressed tokens once (cache for all discriminator updates)
-                compressed_tokens_cached = self.compressor(original_tokens)
 
             # ============================================
-            # Train Discriminator (n_critic iterations)
+            # Train Compressor
             # ============================================
-            for _ in range(self.n_critic):
-                self.optimizer_D.zero_grad(set_to_none=True)
-
-                with autocast(enabled=self.use_amp):
-                    disc_loss, disc_info = self.wgan_loss.discriminator_loss(
-                        compressed_tokens=compressed_tokens_cached,
-                        original_tokens=original_tokens,
-                        discriminator=self.discriminator,
-                        compressed_grid_size=self.compressed_grid_size,
-                        original_grid_size=self.original_grid_size,
-                        device=self.device
-                    )
-
-                self.scaler_D.scale(disc_loss).backward()
-                self.scaler_D.step(self.optimizer_D)
-                self.scaler_D.update()
-
-            # ============================================
-            # Train Generator (Compressor)
-            # ============================================
-            self.optimizer_G.zero_grad(set_to_none=True)
+            self.optimizer.zero_grad(set_to_none=True)
 
             with autocast(enabled=self.use_amp):
                 # Compress tokens
                 compressed_tokens = self.compressor(original_tokens)
 
-                # WGAN generator loss
-                gen_loss, gen_info = self.wgan_loss.generator_loss(
+                # MMD loss
+                mmd_loss, mmd_info = self.mmd_loss(
                     compressed_tokens=compressed_tokens,
-                    discriminator=self.discriminator
+                    original_tokens=original_tokens,
+                    compressed_grid_size=(self.compressed_grid_size, self.compressed_grid_size),
+                    original_grid_size=(self.original_grid_size, self.original_grid_size)
                 )
 
                 # Cosine similarity loss (compute stats only when logging)
@@ -217,29 +168,18 @@ class RFTokenCompressionTrainer:
                 )
 
                 # Combined loss
-                total_loss = self.wgan_weight * gen_loss + self.cosine_weight * cosine_loss
+                total_loss = self.mmd_weight * mmd_loss + self.cosine_weight * cosine_loss
 
-            self.scaler_G.scale(total_loss).backward()
-            self.scaler_G.step(self.optimizer_G)
-            self.scaler_G.update()
+            self.scaler.scale(total_loss).backward()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             # ============================================
             # Update metrics
             # ============================================
-            metrics['disc_loss'] += disc_info['disc_loss']
-            metrics['wasserstein_dist'] += disc_info['wasserstein_distance']
-            metrics['grad_penalty'] += disc_info['gradient_penalty']
-            metrics['real_score_mean'] += disc_info['real_score_mean']
-            metrics['fake_score_mean'] += disc_info['fake_score_mean']
-            metrics['real_score_std'] += disc_info['real_score_std']
-            metrics['fake_score_std'] += disc_info['fake_score_std']
-            metrics['gradient_norm_mean'] += disc_info['gradient_norm_mean']
-            metrics['gradient_norm_std'] += disc_info['gradient_norm_std']
-            metrics['gradient_norm_min'] += disc_info['gradient_norm_min']
-            metrics['gradient_norm_max'] += disc_info['gradient_norm_max']
-            metrics['gen_loss'] += gen_info['gen_loss']
+            metrics['mmd_loss'] += mmd_info['mmd_loss']
             metrics['cosine_loss'] += cosine_info['cosine_sim_loss']
-            metrics['total_gen_loss'] += total_loss.item()
+            metrics['total_loss'] += total_loss.item()
             metrics['mean_similarity'] += cosine_info['mean_similarity']
             metrics['min_similarity'] += cosine_info['min_similarity']
             metrics['max_similarity'] += cosine_info['max_similarity']
@@ -249,27 +189,16 @@ class RFTokenCompressionTrainer:
             # ============================================
             if self.use_wandb and should_log:
                 wandb.log({
-                    # Discriminator losses
-                    'train/disc_loss': disc_info['disc_loss'],
-                    'train/wasserstein_dist': disc_info['wasserstein_distance'],
-                    'train/grad_penalty': disc_info['gradient_penalty'],
+                    # MMD loss
+                    'train/mmd_loss': mmd_info['mmd_loss'],
+                    'train/mmd_squared': mmd_info['mmd_squared'],
+                    'train/K_XX_mean': mmd_info['K_XX_mean'],
+                    'train/K_YY_mean': mmd_info['K_YY_mean'],
+                    'train/K_XY_mean': mmd_info['K_XY_mean'],
 
-                    # Discriminator scores (real vs fake)
-                    'train/real_score_mean': disc_info['real_score_mean'],
-                    'train/fake_score_mean': disc_info['fake_score_mean'],
-                    'train/real_score_std': disc_info['real_score_std'],
-                    'train/fake_score_std': disc_info['fake_score_std'],
-
-                    # Gradient norm statistics
-                    'train/gradient_norm_mean': disc_info['gradient_norm_mean'],
-                    'train/gradient_norm_std': disc_info['gradient_norm_std'],
-                    'train/gradient_norm_min': disc_info['gradient_norm_min'],
-                    'train/gradient_norm_max': disc_info['gradient_norm_max'],
-
-                    # Generator losses
-                    'train/gen_loss': gen_info['gen_loss'],
+                    # Cosine similarity loss
                     'train/cosine_loss': cosine_info['cosine_sim_loss'],
-                    'train/total_gen_loss': total_loss.item(),
+                    'train/total_loss': total_loss.item(),
 
                     # Cosine similarity statistics
                     'train/mean_similarity': cosine_info['mean_similarity'],
@@ -277,9 +206,8 @@ class RFTokenCompressionTrainer:
                     'train/max_similarity': cosine_info['max_similarity'],
                     'train/std_similarity': cosine_info['std_similarity'],
 
-                    # Learning rates
-                    'train/lr_G': self.optimizer_G.param_groups[0]['lr'],
-                    'train/lr_D': self.optimizer_D.param_groups[0]['lr'],
+                    # Learning rate
+                    'train/lr': self.optimizer.param_groups[0]['lr'],
 
                     # Training progress
                     'global_step': self.global_step,
@@ -288,11 +216,10 @@ class RFTokenCompressionTrainer:
 
             # Update progress bar
             pbar.set_postfix({
-                'D': f"{disc_info['disc_loss']:.3f}",
-                'G': f"{gen_info['gen_loss']:.3f}",
+                'MMD': f"{mmd_info['mmd_loss']:.4f}",
                 'Cos': f"{cosine_info['cosine_sim_loss']:.3f}",
                 'Sim': f"{cosine_info['mean_similarity']:.3f}",
-                'WD': f"{disc_info['wasserstein_distance']:.3f}"
+                'Total': f"{total_loss.item():.3f}"
             })
 
             self.global_step += 1
@@ -308,7 +235,6 @@ class RFTokenCompressionTrainer:
     def validate(self, val_loader, epoch: int) -> Dict[str, float]:
         """Validate the model"""
         self.compressor.eval()
-        self.discriminator.eval()
 
         metrics = {
             'val_cosine_loss': 0.0,
@@ -372,11 +298,8 @@ class RFTokenCompressionTrainer:
             'epoch': epoch,
             'global_step': self.global_step,
             'compressor_state_dict': self.compressor.state_dict(),
-            'discriminator_state_dict': self.discriminator.state_dict(),
-            'optimizer_G_state_dict': self.optimizer_G.state_dict(),
-            'optimizer_D_state_dict': self.optimizer_D.state_dict(),
-            'scaler_G_state_dict': self.scaler_G.state_dict(),
-            'scaler_D_state_dict': self.scaler_D.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scaler_state_dict': self.scaler.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': OmegaConf.to_container(self.cfg, resolve=True)
         }
@@ -470,8 +393,8 @@ def main(cfg: DictConfig):
         train_metrics = trainer.train_epoch(train_loader, epoch)
 
         print(f"\n✓ Train Metrics:")
-        print(f"  Disc Loss: {train_metrics['disc_loss']:.4f} | WD: {train_metrics['wasserstein_dist']:.4f}")
-        print(f"  Gen Loss: {train_metrics['gen_loss']:.4f} | Cosine: {train_metrics['cosine_loss']:.4f}")
+        print(f"  MMD Loss: {train_metrics['mmd_loss']:.4f} | Cosine: {train_metrics['cosine_loss']:.4f}")
+        print(f"  Total Loss: {train_metrics['total_loss']:.4f}")
         print(f"  Similarity: {train_metrics['mean_similarity']:.4f} (min: {train_metrics['min_similarity']:.4f}, max: {train_metrics['max_similarity']:.4f})")
 
         # Validate
