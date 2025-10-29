@@ -57,6 +57,11 @@ class RFTokenCompressionTrainer:
         ).to(device)
         self.clip_encoder.eval()
 
+        # Apply torch.compile if enabled
+        if cfg.hardware.compile:
+            print(f"\n✓ Applying torch.compile to CLIP encoder...")
+            self.clip_encoder = torch.compile(self.clip_encoder)
+
         hidden_dim = self.clip_encoder.get_hidden_size()
 
         # Token compressor
@@ -65,6 +70,11 @@ class RFTokenCompressionTrainer:
             output_grid_size=cfg.compression.output_grid_size,
             hidden_dim=hidden_dim
         ).to(device)
+
+        # Apply torch.compile if enabled
+        if cfg.hardware.compile:
+            print(f"\n✓ Applying torch.compile to compressor...")
+            self.compressor = torch.compile(self.compressor)
 
         # Print model info
         rf_size = self.compressor.get_receptive_field_size()
