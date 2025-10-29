@@ -39,9 +39,11 @@ class RFTokenCompressionTrainer:
     def __init__(
         self,
         cfg: DictConfig,
-        device: torch.device
+        device: torch.device,
+        steps_per_epoch: int = None
     ):
         self.cfg = cfg
+        self.steps_per_epoch = steps_per_epoch
         self.device = device
         self.use_wandb = cfg.experiment.use_wandb
 
@@ -141,40 +143,80 @@ class RFTokenCompressionTrainer:
         self.original_grid_size = cfg.compression.input_grid_size
 
     def _build_scheduler(self, cfg: DictConfig):
-        """Build learning rate scheduler with warmup"""
+        """Build learning rate scheduler with warmup (supports epoch or step-based warmup)"""
         if cfg.training.scheduler.type == "cosine":
-            # Calculate total steps
-            # For epoch-based scheduling, we'll update per epoch
-            warmup_epochs = cfg.training.scheduler.warmup_epochs
-            total_epochs = cfg.training.epochs
-            min_lr = cfg.training.scheduler.min_lr
-            base_lr = cfg.training.learning_rate
-
-            # Use CosineAnnealingLR for main schedule
             from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 
-            # Warmup scheduler: linear warmup
-            warmup_scheduler = LinearLR(
-                self.optimizer,
-                start_factor=1e-3,  # Start from 0.001 * base_lr
-                end_factor=1.0,     # End at base_lr
-                total_iters=warmup_epochs
-            )
+            min_lr = cfg.training.scheduler.min_lr
+            base_lr = cfg.training.learning_rate
+            total_epochs = cfg.training.epochs
 
-            # Cosine annealing scheduler
-            cosine_epochs = total_epochs - warmup_epochs
-            cosine_scheduler = CosineAnnealingLR(
-                self.optimizer,
-                T_max=cosine_epochs,
-                eta_min=min_lr
-            )
+            # Determine warmup unit (epoch or step)
+            warmup_unit = cfg.training.scheduler.get('warmup_unit', 'epoch')
 
-            # Combine warmup + cosine
-            scheduler = SequentialLR(
-                self.optimizer,
-                schedulers=[warmup_scheduler, cosine_scheduler],
-                milestones=[warmup_epochs]
-            )
+            if warmup_unit == 'step':
+                # Step-based warmup
+                if self.steps_per_epoch is None:
+                    raise ValueError("steps_per_epoch must be provided for step-based warmup")
+
+                warmup_steps = cfg.training.scheduler.warmup_steps
+                total_steps = self.steps_per_epoch * total_epochs
+
+                # Warmup scheduler: linear warmup (step-based)
+                warmup_scheduler = LinearLR(
+                    self.optimizer,
+                    start_factor=1e-3,  # Start from 0.001 * base_lr
+                    end_factor=1.0,     # End at base_lr
+                    total_iters=warmup_steps
+                )
+
+                # Cosine annealing scheduler (step-based)
+                cosine_steps = total_steps - warmup_steps
+                cosine_scheduler = CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=cosine_steps,
+                    eta_min=min_lr
+                )
+
+                # Combine warmup + cosine
+                scheduler = SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_steps]
+                )
+
+                # Store scheduler type for step() logic
+                scheduler.warmup_unit = 'step'
+
+            else:
+                # Epoch-based warmup (original behavior)
+                warmup_epochs = cfg.training.scheduler.warmup_epochs
+
+                # Warmup scheduler: linear warmup (epoch-based)
+                warmup_scheduler = LinearLR(
+                    self.optimizer,
+                    start_factor=1e-3,  # Start from 0.001 * base_lr
+                    end_factor=1.0,     # End at base_lr
+                    total_iters=warmup_epochs
+                )
+
+                # Cosine annealing scheduler (epoch-based)
+                cosine_epochs = total_epochs - warmup_epochs
+                cosine_scheduler = CosineAnnealingLR(
+                    self.optimizer,
+                    T_max=cosine_epochs,
+                    eta_min=min_lr
+                )
+
+                # Combine warmup + cosine
+                scheduler = SequentialLR(
+                    self.optimizer,
+                    schedulers=[warmup_scheduler, cosine_scheduler],
+                    milestones=[warmup_epochs]
+                )
+
+                # Store scheduler type for step() logic
+                scheduler.warmup_unit = 'epoch'
 
             return scheduler
         else:
@@ -284,6 +326,10 @@ class RFTokenCompressionTrainer:
                 'Sim': f"{cosine_info['mean_similarity']:.3f}",
                 'Total': f"{total_loss.item():.3f}"
             })
+
+            # Step scheduler if using step-based warmup
+            if self.use_scheduler and hasattr(self.scheduler, 'warmup_unit') and self.scheduler.warmup_unit == 'step':
+                self.scheduler.step()
 
             self.global_step += 1
 
@@ -438,7 +484,7 @@ def main(cfg: DictConfig):
     print(f"✓ Batch size: {cfg.training.batch_size}")
 
     # Create trainer
-    trainer = RFTokenCompressionTrainer(cfg, device)
+    trainer = RFTokenCompressionTrainer(cfg, device, steps_per_epoch=len(train_loader))
 
     # Training loop
     print("\n" + "="*80)
@@ -455,11 +501,13 @@ def main(cfg: DictConfig):
         # Train
         train_metrics = trainer.train_epoch(train_loader, epoch)
 
-        # Step scheduler
-        if trainer.use_scheduler:
+        # Step scheduler (only for epoch-based warmup; step-based is called in train_epoch)
+        if trainer.use_scheduler and hasattr(trainer.scheduler, 'warmup_unit') and trainer.scheduler.warmup_unit == 'epoch':
             trainer.scheduler.step()
-            current_lr = trainer.optimizer.param_groups[0]['lr']
-            print(f"\n✓ Learning Rate: {current_lr:.2e}")
+
+        # Print current learning rate
+        current_lr = trainer.optimizer.param_groups[0]['lr']
+        print(f"\n✓ Learning Rate: {current_lr:.2e}")
 
         print(f"\n✓ Train Metrics:")
         print(f"  OT Loss: {train_metrics['ot_loss']:.4f} | Cosine: {train_metrics['cosine_loss']:.4f}")
