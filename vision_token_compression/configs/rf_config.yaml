@@ -39,16 +39,17 @@ training:
   batch_size: 256
   learning_rate: 1e-4
 
-  # Optimizer settings
+  # Optimizer settings (AdamW)
   optimizer:
-    betas: [0.0, 0.9]
-    weight_decay: 0.0
+    betas: [0.9, 0.999]  # Vision Transformer standard (was [0.0, 0.9])
+    weight_decay: 0.05   # Regularization for 9-26M params (was 0.0)
+    eps: 1e-8           # Numerical stability
 
-  # Learning rate scheduler (optional)
+  # Learning rate scheduler with cosine annealing
   scheduler:
-    use: false
+    use: true           # Enable scheduler for better convergence
     type: "cosine"
-    warmup_epochs: 3
+    warmup_epochs: 5    # Longer warmup for batch size 256 (was 3)
     min_lr: 1e-6
 
 # Compression settings - Choose one of 4 supported configurations:

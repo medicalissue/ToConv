@@ -111,12 +111,21 @@ class RFTokenCompressionTrainer:
         self.ot_weight = cfg.loss.weights.sinkhorn_ot
         self.cosine_weight = cfg.loss.weights.cosine
 
-        # Optimizer
-        self.optimizer = torch.optim.Adam(
+        # Optimizer (AdamW for better regularization)
+        self.optimizer = torch.optim.AdamW(
             self.compressor.parameters(),
             lr=cfg.training.learning_rate,
-            betas=tuple(cfg.training.optimizer.betas)
+            betas=tuple(cfg.training.optimizer.betas),
+            weight_decay=cfg.training.optimizer.weight_decay,
+            eps=cfg.training.optimizer.eps
         )
+
+        # Learning rate scheduler
+        self.use_scheduler = cfg.training.scheduler.use
+        if self.use_scheduler:
+            self.scheduler = self._build_scheduler(cfg)
+        else:
+            self.scheduler = None
 
         # Mixed precision training
         self.use_amp = cfg.hardware.mixed_precision
@@ -130,6 +139,46 @@ class RFTokenCompressionTrainer:
         # Grid sizes for loss computation
         self.compressed_grid_size = cfg.compression.output_grid_size
         self.original_grid_size = cfg.compression.input_grid_size
+
+    def _build_scheduler(self, cfg: DictConfig):
+        """Build learning rate scheduler with warmup"""
+        if cfg.training.scheduler.type == "cosine":
+            # Calculate total steps
+            # For epoch-based scheduling, we'll update per epoch
+            warmup_epochs = cfg.training.scheduler.warmup_epochs
+            total_epochs = cfg.training.epochs
+            min_lr = cfg.training.scheduler.min_lr
+            base_lr = cfg.training.learning_rate
+
+            # Use CosineAnnealingLR for main schedule
+            from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+            # Warmup scheduler: linear warmup
+            warmup_scheduler = LinearLR(
+                self.optimizer,
+                start_factor=1e-3,  # Start from 0.001 * base_lr
+                end_factor=1.0,     # End at base_lr
+                total_iters=warmup_epochs
+            )
+
+            # Cosine annealing scheduler
+            cosine_epochs = total_epochs - warmup_epochs
+            cosine_scheduler = CosineAnnealingLR(
+                self.optimizer,
+                T_max=cosine_epochs,
+                eta_min=min_lr
+            )
+
+            # Combine warmup + cosine
+            scheduler = SequentialLR(
+                self.optimizer,
+                schedulers=[warmup_scheduler, cosine_scheduler],
+                milestones=[warmup_epochs]
+            )
+
+            return scheduler
+        else:
+            raise ValueError(f"Unsupported scheduler type: {cfg.training.scheduler.type}")
 
     def train_epoch(self, train_loader, epoch: int) -> Dict[str, float]:
         """Train for one epoch"""
@@ -202,7 +251,7 @@ class RFTokenCompressionTrainer:
             # Logging
             # ============================================
             if self.use_wandb and should_log:
-                wandb.log({
+                log_dict = {
                     # Sinkhorn OT loss
                     'train/ot_loss': ot_info['ot_loss'],
                     'train/ot_distance': ot_info['ot_distance'],
@@ -224,7 +273,9 @@ class RFTokenCompressionTrainer:
                     # Training progress
                     'global_step': self.global_step,
                     'epoch': epoch
-                }, step=self.global_step)
+                }
+
+                wandb.log(log_dict, step=self.global_step)
 
             # Update progress bar
             pbar.set_postfix({
@@ -403,6 +454,12 @@ def main(cfg: DictConfig):
 
         # Train
         train_metrics = trainer.train_epoch(train_loader, epoch)
+
+        # Step scheduler
+        if trainer.use_scheduler:
+            trainer.scheduler.step()
+            current_lr = trainer.optimizer.param_groups[0]['lr']
+            print(f"\n✓ Learning Rate: {current_lr:.2e}")
 
         print(f"\n✓ Train Metrics:")
         print(f"  OT Loss: {train_metrics['ot_loss']:.4f} | Cosine: {train_metrics['cosine_loss']:.4f}")
