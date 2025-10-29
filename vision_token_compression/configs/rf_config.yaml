@@ -53,7 +53,7 @@ training:
 
 # Compression settings - Choose one of 4 supported configurations:
 # 1. 24 → 12: kernel=3, stride=2, RF=3×3 (9.59M params)
-# 2. 24 → 8:  kernel=5, stride=3, RF=5×5 (26.28M params)
+# 2. 24 → 8:  kernel=3, stride=3, RF=3×3 (9.50M params)
 # 3. 16 → 12: kernel=5, stride=1, RF=5×5 (26.36M params)
 # 4. 16 → 8:  kernel=3, stride=2, RF=3×3 (9.50M params)
 compression:

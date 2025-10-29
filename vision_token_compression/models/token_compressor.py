@@ -11,7 +11,7 @@ class TokenCompressor(nn.Module):
 
     Supports 4 compression scenarios:
     1. 24×24 → 12×12 (stride=2, kernel=3, padding=1, RF=3)
-    2. 24×24 → 8×8   (stride=3, kernel=5, padding=2, RF=5)
+    2. 24×24 → 8×8   (stride=3, kernel=3, padding=0, RF=3)
     3. 16×16 → 12×12 (stride=1, kernel=5, padding=0, RF=5)
     4. 16×16 → 8×8   (stride=2, kernel=3, padding=1, RF=3)
     """
@@ -51,8 +51,8 @@ class TokenCompressor(nn.Module):
             kernel_size, stride, padding = 3, 2, 1
 
         elif input_grid_size == 24 and output_grid_size == 8:
-            # 24 → 8: floor((24 - 5 + 4) / 3) + 1 = 8
-            kernel_size, stride, padding = 5, 3, 2
+            # 24 → 8: floor((24 - 3 + 0) / 3) + 1 = 8
+            kernel_size, stride, padding = 3, 3, 0
 
         elif input_grid_size == 16 and output_grid_size == 12:
             # 16 → 12: (16 - 5 + 0) / 1 + 1 = 12
