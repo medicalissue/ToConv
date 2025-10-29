@@ -49,7 +49,7 @@ training:
   scheduler:
     use: true           # Enable scheduler for better convergence
     type: "cosine"
-    warmup_epochs: 5    # Longer warmup for batch size 256 (was 3)
+    warmup_epochs: 1    # Longer warmup for batch size 256 (was 3)
     min_lr: 1e-6
 
 # Compression settings - Choose one of 4 supported configurations:

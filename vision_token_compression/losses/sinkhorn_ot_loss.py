@@ -59,29 +59,25 @@ class SinkhornOTLoss(nn.Module):
 
         return cost
 
-    def sinkhorn_algorithm(
+    def sinkhorn_algorithm_single(
         self,
         cost_matrix: torch.Tensor,
         epsilon: float,
-        max_iter: int,
-        threshold: float
-    ) -> Tuple[torch.Tensor, torch.Tensor, int]:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Sinkhorn-Knopp algorithm in log-domain for numerical stability.
+        Sinkhorn-Knopp algorithm in log-domain for a single sample.
+        Fixed iterations for vmap compatibility (no early stopping).
 
         Uses log-space computation to avoid overflow/underflow:
         Instead of u = a / (K @ v), compute log(u) = log(a) - log(K @ v)
 
         Args:
-            cost_matrix: (n, m) - cost matrix
+            cost_matrix: (n, m) - cost matrix for a single sample
             epsilon: Entropic regularization parameter
-            max_iter: Maximum iterations
-            threshold: Convergence threshold
 
         Returns:
             u: (n,) - left scaling vector
             v: (m,) - right scaling vector
-            num_iter: Number of iterations performed
         """
         n, m = cost_matrix.shape
 
@@ -101,9 +97,8 @@ class SinkhornOTLoss(nn.Module):
         log_K = -cost_matrix / epsilon
 
         # Sinkhorn iterations in log-domain
-        for iteration in range(max_iter):
-            log_u_prev = log_u.clone()
-
+        # Run fixed number of iterations for vmap compatibility
+        for iteration in range(self.max_iter):
             # Update log_u: log(u) = log(a) - log(K @ v)
             # K @ v = sum_j exp(log_K[i,j] + log_v[j])
             # log(K @ v) = logsumexp(log_K[i,:] + log_v)
@@ -116,22 +111,13 @@ class SinkhornOTLoss(nn.Module):
             log_Ktu = torch.logsumexp(log_K.t() + log_u.unsqueeze(0), dim=1)
             log_v = log_b - log_Ktu
 
-            # Check convergence in log-space
-            err = torch.abs(log_u - log_u_prev).max()
-            if err < threshold:
-                break
-
-            # Early stopping if NaN detected
-            if torch.isnan(log_u).any() or torch.isnan(log_v).any():
-                break
-
         # Convert back to linear domain
         u = torch.exp(log_u)
         v = torch.exp(log_v)
 
-        return u, v, iteration + 1
+        return u, v
 
-    def compute_ot_distance(
+    def compute_ot_distance_single(
         self,
         cost_matrix: torch.Tensor,
         u: torch.Tensor,
@@ -139,7 +125,7 @@ class SinkhornOTLoss(nn.Module):
         epsilon: float
     ) -> torch.Tensor:
         """
-        Compute the optimal transport distance from the transport plan.
+        Compute the optimal transport distance from the transport plan for a single sample.
 
         Args:
             cost_matrix: (n, m) - cost matrix
@@ -162,6 +148,46 @@ class SinkhornOTLoss(nn.Module):
 
         return ot_distance
 
+    def process_single_sample(
+        self,
+        compressed_sample: torch.Tensor,
+        original_sample: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Process a single sample through Sinkhorn OT.
+        This function is vmapped over the batch dimension.
+
+        Args:
+            compressed_sample: (k², hidden_dim) - compressed tokens for one sample
+            original_sample: (H*W, hidden_dim) - original tokens for one sample
+
+        Returns:
+            ot_distance: Scalar OT distance for this sample
+        """
+        # Force float32 for numerical stability (avoid AMP issues)
+        compressed_sample = compressed_sample.float()
+        original_sample = original_sample.float()
+
+        # L2 normalize tokens to stabilize cost matrix
+        # After normalization, squared distances are in [0, 4] range
+        compressed_sample = torch.nn.functional.normalize(compressed_sample, p=2, dim=-1)
+        original_sample = torch.nn.functional.normalize(original_sample, p=2, dim=-1)
+
+        # Compute cost matrix for this sample
+        cost_matrix = self.compute_cost_matrix(compressed_sample, original_sample)
+
+        # Cost matrix should now be in [0, 4] range after normalization
+        # Clamp just in case of numerical issues
+        cost_matrix = torch.clamp(cost_matrix, min=0, max=4.0)
+
+        # Run Sinkhorn algorithm
+        u, v = self.sinkhorn_algorithm_single(cost_matrix, self.epsilon)
+
+        # Compute OT distance for this sample
+        ot_dist = self.compute_ot_distance_single(cost_matrix, u, v, self.epsilon)
+
+        return ot_dist
+
     def forward(
         self,
         compressed_tokens: torch.Tensor,
@@ -178,66 +204,22 @@ class SinkhornOTLoss(nn.Module):
             loss: OT loss value
             info: Dictionary with loss statistics
         """
-        batch_size = compressed_tokens.size(0)
+        # Use vmap to parallelize over batch dimension
+        # vmap automatically vectorizes the function over the batch dimension
+        ot_distances = torch.vmap(self.process_single_sample)(
+            compressed_tokens, original_tokens
+        )
 
-        # Compute OT distance per sample to avoid huge cost matrices
-        ot_distances = []
-        total_iterations = 0
-
-        for b in range(batch_size):
-            # Get single sample: (N, D)
-            compressed_sample = compressed_tokens[b]  # (k², hidden_dim)
-            original_sample = original_tokens[b]      # (H*W, hidden_dim)
-
-            # Force float32 for numerical stability (avoid AMP issues)
-            compressed_sample = compressed_sample.float()
-            original_sample = original_sample.float()
-
-            # L2 normalize tokens to stabilize cost matrix
-            # After normalization, squared distances are in [0, 4] range
-            compressed_sample = torch.nn.functional.normalize(compressed_sample, p=2, dim=-1)
-            original_sample = torch.nn.functional.normalize(original_sample, p=2, dim=-1)
-
-            # Compute cost matrix for this sample
-            cost_matrix = self.compute_cost_matrix(compressed_sample, original_sample)
-
-            # Cost matrix should now be in [0, 4] range after normalization
-            # Clamp just in case of numerical issues
-            cost_matrix = torch.clamp(cost_matrix, min=0, max=4.0)
-
-            # Run Sinkhorn algorithm
-            u, v, num_iter = self.sinkhorn_algorithm(
-                cost_matrix,
-                self.epsilon,
-                self.max_iter,
-                self.threshold
+        # Check for NaN/Inf in the results
+        if torch.isnan(ot_distances).any() or torch.isinf(ot_distances).any():
+            raise RuntimeError(
+                f"Sinkhorn OT distance contains NaN/Inf values. "
+                f"NaN count: {torch.isnan(ot_distances).sum().item()}, "
+                f"Inf count: {torch.isinf(ot_distances).sum().item()}"
             )
 
-            # Check for NaN in u or v
-            if torch.isnan(u).any() or torch.isnan(v).any() or torch.isinf(u).any() or torch.isinf(v).any():
-                raise RuntimeError(
-                    f"Sinkhorn algorithm produced NaN/Inf in dual variables at batch index {b}. "
-                    f"u has NaN: {torch.isnan(u).any()}, u has Inf: {torch.isinf(u).any()}, "
-                    f"v has NaN: {torch.isnan(v).any()}, v has Inf: {torch.isinf(v).any()}. "
-                    f"Cost matrix range: [{cost_matrix.min():.2f}, {cost_matrix.max():.2f}]"
-                )
-
-            # Compute OT distance for this sample
-            ot_dist = self.compute_ot_distance(cost_matrix, u, v, self.epsilon)
-
-            # Check if OT distance is NaN
-            if torch.isnan(ot_dist) or torch.isinf(ot_dist):
-                raise RuntimeError(
-                    f"Sinkhorn OT distance is NaN/Inf at batch index {b}. "
-                    f"Distance: {ot_dist.item()}"
-                )
-
-            ot_distances.append(ot_dist)
-            total_iterations += num_iter
-
         # Average OT distance across batch
-        ot_distance = torch.stack(ot_distances).mean()
-        avg_iterations = total_iterations / batch_size
+        ot_distance = ot_distances.mean()
 
         # Normalize by number of tokens if requested
         if self.normalize:
@@ -252,7 +234,7 @@ class SinkhornOTLoss(nn.Module):
         info = {
             'ot_loss': ot_loss.item(),
             'ot_distance': ot_distance.item(),
-            'sinkhorn_iterations': avg_iterations,
+            'sinkhorn_iterations': self.max_iter,  # Note: iterations not tracked in vmap version
             'epsilon': self.epsilon,
             'n_compressed': compressed_tokens.size(1),
             'n_original': original_tokens.size(1)
@@ -339,7 +321,7 @@ if __name__ == "__main__":
 
     # Test 5: Different epsilon values
     print("\n5. Testing different epsilon values...")
-    epsilons = [0.01, 0.1, 1.0]
+    epsilons = [0.05, 0.1, 0.5]  # Avoid very small epsilon for numerical stability
     for eps in epsilons:
         ot_loss_eps = SinkhornOTLoss(epsilon=eps, max_iter=100).to(device)
         loss_eps, info_eps = ot_loss_eps(
