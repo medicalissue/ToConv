@@ -66,7 +66,17 @@ compression:
 
 # Data settings
 data:
+  dataset_type: "coco"  # Choose "imagenet" or "coco"
+
+  # ImageNet settings
   imagenet_root: "/data/ImageNet"  # UPDATE THIS PATH
+
+  # COCO settings
+  coco_root: "/data/codo"  # UPDATE THIS PATH
+  coco_annotation_train: null  # Default: {coco_root}/annotations/instances_train2017.json
+  coco_annotation_val: null    # Default: {coco_root}/annotations/instances_val2017.json
+
+  # Common settings
   num_workers: 24
   pin_memory: true
   use_subset: false  # Set to true for quick testing

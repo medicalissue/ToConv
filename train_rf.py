@@ -20,7 +20,7 @@ from vision_token_compression.models import (
     TokenCompressor
 )
 from vision_token_compression.losses import SinkhornOTLoss, RFCosineSimilarityLoss
-from vision_token_compression.data import create_imagenet_dataloaders
+from vision_token_compression.data import create_dataloaders
 
 
 def set_seed(seed: int):
@@ -469,14 +469,18 @@ def main(cfg: DictConfig):
     print("Loading Data...")
     print("="*80)
 
-    train_loader, val_loader = create_imagenet_dataloaders(
-        root=cfg.data.imagenet_root,
+    train_loader, val_loader = create_dataloaders(
+        dataset_type=cfg.data.dataset_type,
         batch_size=cfg.training.batch_size,
         num_workers=cfg.data.num_workers,
         image_size=cfg.model.clip.image_size,
         pin_memory=cfg.data.pin_memory,
         use_subset=cfg.data.use_subset,
-        subset_size=cfg.data.subset_size
+        subset_size=cfg.data.subset_size,
+        imagenet_root=cfg.data.get('imagenet_root'),
+        coco_root=cfg.data.get('coco_root'),
+        coco_annotation_train=cfg.data.get('coco_annotation_train'),
+        coco_annotation_val=cfg.data.get('coco_annotation_val')
     )
 
     print(f"\n✓ Train: {len(train_loader)} batches")
