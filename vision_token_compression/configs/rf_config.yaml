@@ -52,10 +52,11 @@ training:
     min_lr: 1e-6
 
 # Compression settings - Choose one of 4 supported configurations:
-# 1. 24 → 12: kernel=3, stride=2, RF=3×3 (9.59M params)
-# 2. 24 → 8:  kernel=3, stride=3, RF=3×3 (9.50M params)
-# 3. 16 → 12: kernel=5, stride=1, RF=5×5 (26.36M params)
-# 4. 16 → 8:  kernel=3, stride=2, RF=3×3 (9.50M params)
+# Uses Partial Convolution instead of zero padding for better boundary handling
+# 1. 24 → 12: kernel=3, stride=2, padding=1, RF=3×3 (9.59M params)
+# 2. 24 → 8:  kernel=3, stride=3, padding=0, RF=3×3 (9.50M params)
+# 3. 16 → 12: kernel=5, stride=1, padding=0, RF=5×5 (26.36M params)
+# 4. 16 → 8:  kernel=3, stride=2, padding=1, RF=3×3 (9.50M params)
 compression:
   input_grid_size: 16   # Input token grid size: 16 or 24
   output_grid_size: 8   # Output token grid size: 8 or 12

@@ -2,11 +2,15 @@
 import torch
 import torch.nn as nn
 import math
+from .partial_conv import PartialConv2d
 
 
 class TokenCompressor(nn.Module):
     """
-    Pure convolution-based token compressor using Theoretical Receptive Field.
+    Pure convolution-based token compressor using Theoretical Receptive Field
+    with Partial Convolution for proper padding handling.
+
+    Uses Partial Convolution instead of zero padding to avoid artifacts at boundaries.
     NO adaptive pooling, NO bottleneck - single convolution achieves exact output size.
 
     Supports 4 compression scenarios:
@@ -67,19 +71,17 @@ class TokenCompressor(nn.Module):
         self.stride = stride
         self.padding = padding
 
-        # Single convolution layer: hidden_dim → hidden_dim directly
-        self.compress_conv = nn.Sequential(
-            nn.Conv2d(
-                hidden_dim,
-                hidden_dim,
-                kernel_size=kernel_size,
-                stride=stride,
-                padding=padding,
-                bias=False
-            ),
-            nn.GroupNorm(32, hidden_dim),
-            nn.GELU()
+        # Single convolution layer with Partial Convolution: hidden_dim → hidden_dim directly
+        self.compress_conv = PartialConv2d(
+            hidden_dim,
+            hidden_dim,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+            bias=False
         )
+        self.norm = nn.GroupNorm(32, hidden_dim)
+        self.activation = nn.GELU()
 
         # Learnable position embeddings
         self.pos_embed = nn.Parameter(
@@ -98,13 +100,13 @@ class TokenCompressor(nn.Module):
             )
 
         print(f"TokenCompressor [{self.config_name}]: {input_grid_size}×{input_grid_size} → {output_grid_size}×{output_grid_size}")
-        print(f"  Architecture: Conv(k={kernel_size}, s={stride}, p={padding})")
+        print(f"  Architecture: PartialConv(k={kernel_size}, s={stride}, p={padding})")
         print(f"  Theoretical RF: {self.receptive_field_size}×{self.receptive_field_size}")
 
 
     def forward(self, tokens: torch.Tensor) -> torch.Tensor:
         """
-        Compress tokens with single convolution.
+        Compress tokens with single partial convolution.
 
         Args:
             tokens: (batch_size, num_patches, hidden_dim)
@@ -117,8 +119,17 @@ class TokenCompressor(nn.Module):
         # Reshape to 2D grid: (B, N, C) → (B, C, H, W)
         tokens_2d = self._to_2d(tokens)
 
-        # Single convolution compression (no bottleneck)
-        x = self.compress_conv(tokens_2d)
+        # Create mask: all original tokens are valid (1), padding regions will be handled by PartialConv
+        # Mask shape: (B, 1, H, W)
+        mask = torch.ones(batch_size, 1, self.input_grid_size, self.input_grid_size,
+                         device=tokens_2d.device, dtype=tokens_2d.dtype)
+
+        # Partial convolution compression (handles padding properly)
+        x, output_mask = self.compress_conv(tokens_2d, mask)
+
+        # Apply normalization and activation
+        x = self.norm(x)
+        x = self.activation(x)
 
         # Verify output size (no adaptive pooling!)
         assert x.shape[2] == self.output_grid_size and x.shape[3] == self.output_grid_size, \
