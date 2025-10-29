@@ -19,18 +19,19 @@ model:
 
 # Loss settings
 loss:
-  mmd:
-    kernel_mul: 2.0  # Multiplier for bandwidth in multi-scale kernel
-    kernel_num: 5    # Number of kernels to use in multi-scale kernel
-    fix_sigma: null  # If provided, use fixed bandwidth. Otherwise, compute adaptively
+  sinkhorn_ot:
+    epsilon: 0.1      # Entropic regularization parameter (smaller = closer to exact OT, but slower)
+    max_iter: 100     # Maximum number of Sinkhorn iterations
+    threshold: 1e-3   # Convergence threshold for stopping criterion
+    normalize: true   # Whether to normalize the cost by the number of samples
 
   rf_cosine_similarity:
     # Loss = 1 - mean_similarity (range: 0 to 2)
     # No additional parameters needed
 
   weights:
-    mmd: 1.0       # Weight for MMD loss
-    cosine: 1.0    # Weight for Cosine Similarity loss
+    sinkhorn_ot: 1.0  # Weight for Sinkhorn OT loss
+    cosine: 1.0       # Weight for Cosine Similarity loss
 
 # Training settings
 training:

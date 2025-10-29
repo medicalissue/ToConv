@@ -19,7 +19,7 @@ from vision_token_compression.models import (
     CLIPVisionEncoder,
     TokenCompressor
 )
-from vision_token_compression.losses import MMDLoss, RFCosineSimilarityLoss
+from vision_token_compression.losses import SinkhornOTLoss, RFCosineSimilarityLoss
 from vision_token_compression.data import create_imagenet_dataloaders
 
 
@@ -85,14 +85,15 @@ class RFTokenCompressionTrainer:
         print(f"\n✓ Total trainable params: {total_params/1e6:.2f}M")
 
         # Build losses
-        self.mmd_loss = MMDLoss(
-            kernel_mul=cfg.loss.mmd.kernel_mul,
-            kernel_num=cfg.loss.mmd.kernel_num,
-            fix_sigma=cfg.loss.mmd.get('fix_sigma', None)
+        self.ot_loss = SinkhornOTLoss(
+            epsilon=cfg.loss.sinkhorn_ot.epsilon,
+            max_iter=cfg.loss.sinkhorn_ot.max_iter,
+            threshold=cfg.loss.sinkhorn_ot.threshold,
+            normalize=cfg.loss.sinkhorn_ot.normalize
         )
         self.cosine_loss = RFCosineSimilarityLoss()
 
-        self.mmd_weight = cfg.loss.weights.mmd
+        self.ot_weight = cfg.loss.weights.sinkhorn_ot
         self.cosine_weight = cfg.loss.weights.cosine
 
         # Optimizer
@@ -122,7 +123,7 @@ class RFTokenCompressionTrainer:
 
         # Accumulators
         metrics = {
-            'mmd_loss': 0.0,
+            'ot_loss': 0.0,
             'cosine_loss': 0.0,
             'total_loss': 0.0,
             'mean_similarity': 0.0,
@@ -149,12 +150,10 @@ class RFTokenCompressionTrainer:
                 # Compress tokens
                 compressed_tokens = self.compressor(original_tokens)
 
-                # MMD loss
-                mmd_loss, mmd_info = self.mmd_loss(
+                # Sinkhorn OT loss
+                ot_loss, ot_info = self.ot_loss(
                     compressed_tokens=compressed_tokens,
-                    original_tokens=original_tokens,
-                    compressed_grid_size=(self.compressed_grid_size, self.compressed_grid_size),
-                    original_grid_size=(self.original_grid_size, self.original_grid_size)
+                    original_tokens=original_tokens
                 )
 
                 # Cosine similarity loss (compute stats only when logging)
@@ -168,7 +167,7 @@ class RFTokenCompressionTrainer:
                 )
 
                 # Combined loss
-                total_loss = self.mmd_weight * mmd_loss + self.cosine_weight * cosine_loss
+                total_loss = self.ot_weight * ot_loss + self.cosine_weight * cosine_loss
 
             self.scaler.scale(total_loss).backward()
             self.scaler.step(self.optimizer)
@@ -177,7 +176,7 @@ class RFTokenCompressionTrainer:
             # ============================================
             # Update metrics
             # ============================================
-            metrics['mmd_loss'] += mmd_info['mmd_loss']
+            metrics['ot_loss'] += ot_info['ot_loss']
             metrics['cosine_loss'] += cosine_info['cosine_sim_loss']
             metrics['total_loss'] += total_loss.item()
             metrics['mean_similarity'] += cosine_info['mean_similarity']
@@ -189,12 +188,10 @@ class RFTokenCompressionTrainer:
             # ============================================
             if self.use_wandb and should_log:
                 wandb.log({
-                    # MMD loss
-                    'train/mmd_loss': mmd_info['mmd_loss'],
-                    'train/mmd_squared': mmd_info['mmd_squared'],
-                    'train/K_XX_mean': mmd_info['K_XX_mean'],
-                    'train/K_YY_mean': mmd_info['K_YY_mean'],
-                    'train/K_XY_mean': mmd_info['K_XY_mean'],
+                    # Sinkhorn OT loss
+                    'train/ot_loss': ot_info['ot_loss'],
+                    'train/ot_distance': ot_info['ot_distance'],
+                    'train/sinkhorn_iterations': ot_info['sinkhorn_iterations'],
 
                     # Cosine similarity loss
                     'train/cosine_loss': cosine_info['cosine_sim_loss'],
@@ -216,7 +213,7 @@ class RFTokenCompressionTrainer:
 
             # Update progress bar
             pbar.set_postfix({
-                'MMD': f"{mmd_info['mmd_loss']:.4f}",
+                'OT': f"{ot_info['ot_loss']:.4f}",
                 'Cos': f"{cosine_info['cosine_sim_loss']:.3f}",
                 'Sim': f"{cosine_info['mean_similarity']:.3f}",
                 'Total': f"{total_loss.item():.3f}"
@@ -393,7 +390,7 @@ def main(cfg: DictConfig):
         train_metrics = trainer.train_epoch(train_loader, epoch)
 
         print(f"\n✓ Train Metrics:")
-        print(f"  MMD Loss: {train_metrics['mmd_loss']:.4f} | Cosine: {train_metrics['cosine_loss']:.4f}")
+        print(f"  OT Loss: {train_metrics['ot_loss']:.4f} | Cosine: {train_metrics['cosine_loss']:.4f}")
         print(f"  Total Loss: {train_metrics['total_loss']:.4f}")
         print(f"  Similarity: {train_metrics['mean_similarity']:.4f} (min: {train_metrics['min_similarity']:.4f}, max: {train_metrics['max_similarity']:.4f})")
 
